@@ -4,7 +4,7 @@ Open-source templates, skills, and frameworks for using AI as a
 personal systems architect.
 
 Built and maintained by Dima Kaleganov.
-Product ops at Microsoft Advertising Platform by day.
+Product @ Microsoft AI.
 AI builder, photographer, and animator on the weekends.
 
 ## What's in here
