@@ -15,14 +15,6 @@ AI builder, photographer, and animator on the weekends.
   context. Includes a vetted source library, failure modes, and
   clinical escalation rules.
 
-- More artifacts coming. Roadmap below.
-
-## Roadmap
-
-- [ ] LinkedIn writing skill
-- [ ] Claude Projects templates for photography, Airbnb, and real estate
-- [ ] First prototype app
-
 ## Why this exists
 
 The bottleneck on personal AI is not access to AI. It is the work of
