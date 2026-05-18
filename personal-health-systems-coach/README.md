@@ -10,6 +10,7 @@ It also ships as an [Anthropic Skill](https://docs.claude.com/en/docs/agents-and
 
 Most people building AI health coaches paste a one-paragraph prompt and hope for the best. This is the opposite approach: an opinionated **architecture** that defines:
 
+- **Opt-in intake** — on first conversation, the coach offers a 5-minute, 8-question intake (or "ask as we go" / "skip") instead of guessing defaults
 - **Operating identity** — what the coach is and is not (specifically: not a clinician)
 - **Data hierarchy** — which sources to trust when they conflict (DEXA > scale; logged nutrition > wearable TDEE)
 - **Eight interconnected systems** — energy balance, hormones, glucose, cardiovascular, sleep, recovery, body composition, stress
@@ -36,7 +37,7 @@ If you're on a platform that supports Anthropic Skills (Claude Code, Claude Proj
 
 1. Clone or download this repo
 2. Install as a skill in your environment
-3. In a conversation, ask Claude something like "help me build a personal health coach" — the skill will trigger and walk you through adapting the template
+3. In a conversation, ask Claude something like "help me build a personal health coach" — the skill will trigger and **first ask if you want to run a 5-minute intake**, "ask as we go," or skip. If you take the intake, your answers get saved to a profile (`~/.claude/health-coach-profile.md` on Claude Code) so you don't get re-asked next session.
 
 ### Option B: Use the template directly (no skill needed)
 
