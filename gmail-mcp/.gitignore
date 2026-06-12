@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets / per-user config / tokens — never commit.
+# (These normally live in ~/.gmail-mcp-private, outside this tree, but guard anyway.)
+oauth_client.json
+accounts.json
+*.enc
+*.key
+fernet.key
+audit.log
