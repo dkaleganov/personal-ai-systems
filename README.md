@@ -15,6 +15,12 @@ AI builder, photographer, and animator on the weekends.
   context. Includes a vetted source library, failure modes, and
   clinical escalation rules.
 
+- **gmail-mcp/** — A self-hosted MCP server that gives Claude read,
+  triage, and draft access to multiple Gmail / Google Workspace
+  accounts at once (the official connector handles one). Drafts-only
+  by default, no delete ever, per-account encrypted tokens, and a
+  CLAUDE.md so Claude Code can walk you through your own setup.
+
 ## Why this exists
 
 The bottleneck on personal AI is not access to AI. It is the work of

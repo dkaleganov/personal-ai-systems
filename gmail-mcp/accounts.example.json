@@ -1,0 +1,9 @@
+{
+  "accounts": [
+    { "alias": "personal", "email": "you@gmail.com",       "scope": "modify" },
+    { "alias": "work",     "email": "you@yourcompany.com", "scope": "modify" }
+  ],
+  "enable_send": false,
+
+  "_comment": "Add one entry per Gmail/Workspace account. alias = the short name you'll use in tool calls ([A-Za-z0-9_-]+, unique); email = the exact address (unique). scope is 'modify' (read + label/archive + draft, never permanent delete) or 'readonly'. enable_send=false means no send tool is exposed; arming send ALSO requires GMAIL_MCP_ALLOW_SEND=1 in the server's environment (two-factor — a config edit alone can never enable sending). Copy this file to ~/.gmail-mcp-private/accounts.json and put your real values in."
+}

@@ -1,0 +1,13 @@
+# gmail-mcp-private dependencies.
+# Only official Anthropic + Google libraries, plus standard crypto/keyring.
+# These ">=" floors are for the draft; at install we pin an exact, verified set:
+#   pip install -r requirements.txt && pip freeze > requirements.lock
+# and thereafter install from requirements.lock so nothing updates underneath us.
+
+mcp>=1.2.0                      # official Anthropic MCP SDK (FastMCP)
+google-api-python-client>=2.100.0   # official Google API client (Gmail)
+google-auth>=2.30.0                 # official Google auth
+google-auth-oauthlib>=1.2.0         # official OAuth installed-app (loopback) flow
+google-auth-httplib2>=0.2.0         # transport
+cryptography>=42.0.0                # Fernet token encryption at rest
+keyring>=24.0.0                     # store the encryption key in the macOS Keychain
