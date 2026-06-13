@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-command setup for gmail-mcp. Run from inside this folder:  ./setup.sh
+# One-command setup for multi-gmail-private-mcp. Run from inside this folder:  ./setup.sh
 # Installs the venv + locked deps, checks your config, runs one browser sign-in per
 # account, registers the server with Claude Code, and verifies.
 set -euo pipefail
@@ -73,9 +73,9 @@ done
 
 echo "==> 6/6  register with Claude Code (user scope) + verify"
 CLAUDE="$(command -v claude || echo "$HOME/.local/bin/claude")"
-"$CLAUDE" mcp add --scope user gmail-private -- "$HERE/.venv/bin/python" "$HERE/server.py" 2>&1 || true
+"$CLAUDE" mcp add --scope user multi-gmail-private-mcp -- "$HERE/.venv/bin/python" "$HERE/server.py" 2>&1 || true
 "$HERE/.venv/bin/python" "$HERE/authenticate.py" --list
 
 echo
 echo "Done. Open a NEW Claude session and try:  list_accounts"
-echo "Kill switch: claude mcp remove gmail-private   (or delete ~/.gmail-mcp-private)"
+echo "Kill switch: claude mcp remove multi-gmail-private-mcp   (or delete ~/.gmail-mcp-private)"

@@ -71,7 +71,7 @@ for _a in CONFIG.get("accounts", []):
 _ALIASES = sorted({a["alias"] for a in CONFIG.get("accounts", [])})
 _verified: set[str] = set()  # aliases whose token identity matched config this process
 
-mcp = FastMCP("gmail-private")
+mcp = FastMCP("multi-gmail-private-mcp")
 
 # --- untrusted-content handling -----------------------------------------------
 _MARKER_RE = re.compile(r"-{3,}\s*(BEGIN|END)\s+UNTRUSTED", re.I)

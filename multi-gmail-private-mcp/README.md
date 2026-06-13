@@ -1,4 +1,4 @@
-# gmail-mcp — private, multi-account Gmail for Claude
+# multi-gmail-private-mcp
 
 A small, self-hosted MCP server that gives Claude **read + triage + draft** access to
 **all of your Gmail / Google Workspace accounts** — as many as you want, in one connector.
@@ -13,12 +13,12 @@ to Google's API, and no third-party service ever sits in the middle.
        Claude            (desktop app / Claude Code)
          |  MCP · stdio · local-only
          v
-   +-----------------------------------------------+
-   |  gmail-mcp  (Python, ~900 lines, this repo)   |
-   |  search · read · label · archive · draft      |
-   |  NO send by default · NO delete, ever         |
-   |  per-account encrypted tokens · audit log     |
-   +-----------------------------------------------+
+   +-------------------------------------------------+
+   |  multi-gmail-private-mcp  (Python, ~900 lines)  |
+   |  search · read · label · archive · draft        |
+   |  NO send by default · NO delete, ever           |
+   |  per-account encrypted tokens · audit log       |
+   +-------------------------------------------------+
          |  one OAuth token per account (Fernet-encrypted,
          |  key in the macOS Keychain)
          v
@@ -75,7 +75,7 @@ This repo ships a [CLAUDE.md](CLAUDE.md) that briefs Claude Code on the entire s
 
 ```bash
 git clone https://github.com/dkaleganov/personal-ai-systems
-cd personal-ai-systems/gmail-mcp
+cd personal-ai-systems/multi-gmail-private-mcp
 claude
 ```
 
@@ -140,7 +140,7 @@ and never opens a port.
 
 ## Kill switch
 
-- **Disable:** `claude mcp remove gmail-private`
+- **Disable:** `claude mcp remove multi-gmail-private-mcp`
 - **Revoke one account:** delete `~/.gmail-mcp-private/tokens/<alias>.enc` and/or revoke
   the app at <https://myaccount.google.com/permissions>
 - **Remove everything:** delete `~/.gmail-mcp-private/`
