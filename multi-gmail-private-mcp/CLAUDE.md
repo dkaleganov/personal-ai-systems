@@ -51,7 +51,7 @@ sign-in. Everything below is your playbook.
    admin must allow the client (Admin console → Security → API controls → App access control).
 
 6. **Register with Claude Code (user scope, absolute paths):**
-   `claude mcp add --scope user gmail-private -- "$PWD/.venv/bin/python" "$PWD/server.py"`
+   `claude mcp add --scope user multi-gmail-private-mcp -- "$PWD/.venv/bin/python" "$PWD/server.py"`
 
 7. **Verify:** `.venv/bin/python authenticate.py --list` shows every alias; then tell the
    user to open a NEW Claude session and ask for `list_accounts` — every account should
@@ -66,5 +66,5 @@ sign-in. Everything below is your playbook.
 - **`invalid_client`** — the `oauth_client.json` is malformed or the wrong type; it must be
   a **Desktop app** client.
 - **Workspace sign-in blocked** — org policy; see the admin step above.
-- **Kill switch** — `claude mcp remove gmail-private`; revoke at
+- **Kill switch** — `claude mcp remove multi-gmail-private-mcp`; revoke at
   myaccount.google.com/permissions; delete `~/.gmail-mcp-private/` to remove everything.

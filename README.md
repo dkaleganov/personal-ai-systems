@@ -15,7 +15,7 @@ AI builder, photographer, and animator on the weekends.
   context. Includes a vetted source library, failure modes, and
   clinical escalation rules.
 
-- **gmail-mcp/** — A self-hosted MCP server that gives Claude read,
+- **multi-gmail-private-mcp/** — A self-hosted MCP server that gives Claude read,
   triage, and draft access to multiple Gmail / Google Workspace
   accounts at once (the official connector handles one). Drafts-only
   by default, no delete ever, per-account encrypted tokens, and a
