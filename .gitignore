@@ -1,0 +1,28 @@
+# --- Secrets & private-config tripwires (unanchored: ignored at any depth) ---
+# These files must never exist in this repo, even locally. The ignore rules are
+# a tripwire, not a policy: real registries, tokens, and private context belong
+# in a separate private environment.
+.env
+.env.*
+!.env.example
+entities.yaml
+tokens.sqlite
+CLAUDE.local.md
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+dist/
+build/
+*.egg-info/
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/
