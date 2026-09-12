@@ -54,10 +54,25 @@ Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 2. Copy `entities.example.yaml` to a private location outside this repo and
    list your orgs (`key`, `display_name`, `token_env`).
 3. Export one env var per org, named as in the registry, in the environment
-   that launches the server. `.env.example` shows the names; a `.env` file
-   next to the launch directory is loaded if present (never committed).
+   that launches the server (`.env.example` shows the names). Configuration
+   is read from process environment variables only; **no `.env` file is
+   read unless you pass `--env-file <path>`**, so nothing is picked up by
+   accident from the repo, your home directory, or a `uvx` cache.
 4. Optional: `MERCURY_API_BASE=https://api-sandbox.mercury.com` with
    sandbox-created tokens.
+
+### Command line
+
+| Flag / env var | Meaning |
+| --- | --- |
+| `--entities PATH` / `MERCURY_ENTITIES_FILE` | Entity registry YAML. Required (flag wins over env var); there is no implicit default. |
+| `--env-file PATH` | Load this dotenv file before resolving tokens. Existing env vars win. Without the flag no dotenv file is read from anywhere. |
+| `--api-base URL` / `MERCURY_API_BASE` | Mercury API host, default `https://api.mercury.com`. Must be `https://`; plain `http://` is accepted only for `localhost` / `127.0.0.1` mocks. |
+| `--version` | Print the package version and exit. |
+
+Startup problems (missing registry, invalid YAML, bad API base) print one
+line to stderr and exit with status 2. Stdout is reserved for the MCP
+protocol.
 
 Mercury deletes tokens unused for 45 days and downgrades unused permissions on
 the same clock; a keepalive CLI ships in Phase 2.

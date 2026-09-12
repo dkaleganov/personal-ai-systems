@@ -11,7 +11,12 @@ entity key, so one AI session can see a whole multi-entity setup.
 This package lives in a public monorepo. It is public from its first
 commit. No personal names, real company names, EINs, account numbers,
 tokens, or financial identifiers may appear in tracked files, test
-fixtures, comments, or commit messages at any point in history.
+fixtures, comments, or commit messages at any point in history. One
+deliberate exception, decided by the repo owner: the maintainer's own
+name may appear in package `authors` metadata (pyproject) and the monorepo
+README. Business names, family names, and every other identifier remain
+forbidden. Synthetic fixtures must not reuse real-world identifiers even
+when public (e.g. no real ABA routing numbers; use obviously fake values).
 
 ## Ground rules (every session in this folder)
 
@@ -34,14 +39,27 @@ fixtures, comments, or commit messages at any point in history.
 ## Tool surface (all read-only, `entity` required, no defaults)
 
 Phase 1 — core:
-- `list_entities`: keys and display names from the registry, nothing else
+- `list_entities`: keys and display names from the registry, plus
+  `token_configured` (bool: the entity's env var is set and non-blank;
+  never the value). Intended.
 - `list_accounts(entity)`: accounts with available/current balances
   (balances ride on `GET /accounts`; there is no separate balance endpoint)
 - `list_transactions(entity, account_id?, start?, end?, search?, limit?)`:
   org-wide via `GET /transactions` (filters: status, search, date ranges,
-  accountId, category; cursor pagination, max 1000/page) or per-account
-- `server_info`: package version and configured entity count (no secrets),
-  so a client can verify which build is running
+  accountId, category; cursor pagination, max 1000/page). Per-account
+  filtering uses the `accountId` filter on the same endpoint, not
+  `GET /account/{id}/transactions` (offset-paginated, different envelope).
+- `server_info`: `name`, package `version`, `api_base`, `entity_count`,
+  `entities_with_token`, `transport` ("stdio"), `read_only` (true). No
+  secrets. Intended, so a client can verify which build and config it is
+  talking to.
+
+Identifier masking (decided Phase 1, applies to every phase): tool output
+is an explicit allowlist projection of the live schema, never the raw
+object. `accountNumber` is returned only as `accountNumberLast4`;
+`routingNumber` and transaction `details` (counterparty routing/account
+numbers) are never returned. The allowlists in `server.py` enumerate every
+excluded live-schema field with a reason; extend them deliberately.
 
 Phase 2 — 1099 support:
 - `reportable_totals(entity, year, threshold=2000)`: per-recipient payment
@@ -115,6 +133,16 @@ stdio only; the server never opens a network listener.
 - Never log, print, or return more than the last 4 characters of any
   token. A missing token for one entity is a clean per-entity error, not
   a crash, and must not affect other entities.
+- Dotenv policy: configuration is read from process environment variables
+  only. A dotenv file is loaded solely when `--env-file <path>` is passed
+  (existing env vars win). There is no implicit `.env` search: python-dotenv's
+  default walks up from the installed package directory, which under `uvx`
+  or a clone would read unrelated `.env` files.
+- `--api-base` / `MERCURY_API_BASE` must be `https://`; plain `http://` is
+  accepted only for `localhost` / `127.0.0.1` mocks. Anything else is a
+  clean startup error (exit 2).
+- `main()` installs a redacting `logging.Filter` on the root logger and its
+  handlers so SDK ERROR tracebacks on stderr cannot carry a token.
 
 ## Untrusted data
 
@@ -177,6 +205,10 @@ not use the third-party standalone `fastmcp` package — official SDK only.
    monorepo LICENSE applies); gitleaks scan across full history; tag
    `mercury-v0.1.0`. Acceptance: gitleaks is clean and a fresh clone
    installs and passes tests from the README alone.
+   Deferred here from the Phase 1 review: add a LICENSE file inside the
+   package so wheels/sdists carry it (`license-files` in pyproject), and
+   drop the deprecated `License :: OSI Approved :: MIT License` classifier
+   in favour of the SPDX `license = "MIT"` expression alone.
 
 ## Definition of done for public
 

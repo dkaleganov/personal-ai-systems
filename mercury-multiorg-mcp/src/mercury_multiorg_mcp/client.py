@@ -17,6 +17,7 @@ import os
 import random
 from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 import anyio
 import httpx
@@ -37,9 +38,28 @@ MAX_PAGES = 200
 _RETRY_STATUSES = frozenset({429, 502, 503, 504})
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
 def api_base_from_env() -> str:
     """Resolve the API host (not including /api/v1) from ``MERCURY_API_BASE``."""
     return os.environ.get(API_BASE_ENV, "").strip() or DEFAULT_API_BASE
+
+
+def validate_api_base(url: str) -> str:
+    """Require ``https://`` for the API host; plain ``http://`` only on loopback (mocks).
+
+    Returns the host URL with any trailing slash removed. Raises ``ValueError``
+    with a message safe to print.
+    """
+    candidate = (url or "").strip().rstrip("/")
+    parts = urlsplit(candidate)
+    host = (parts.hostname or "").lower()
+    if not host or parts.scheme not in ("http", "https") or parts.path or parts.query or parts.fragment:
+        raise ValueError(f"api_base must be a bare https:// host such as {DEFAULT_API_BASE}; got {url!r}")
+    if parts.scheme == "http" and host not in _LOOPBACK_HOSTS:
+        raise ValueError(f"api_base must use https:// (plain http is only allowed for localhost/127.0.0.1); got {url!r}")
+    return candidate
 
 
 class MercuryClient:
@@ -71,7 +91,7 @@ class MercuryClient:
         if not token or not token.strip():
             raise ValueError("token must be a non-empty string")
         self._token = token.strip()
-        base = (api_base or api_base_from_env()).rstrip("/")
+        base = validate_api_base(api_base or api_base_from_env())
         self.base_url = base + API_PREFIX
         self.max_retries = max(0, int(max_retries))
         self._sleep = sleep or anyio.sleep
@@ -114,14 +134,28 @@ class MercuryClient:
         return redact(text, self._token)
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        """Perform a GET with 429/5xx backoff. The only request method in the package."""
+        """Perform a GET with bounded backoff. The only request method in the package.
+
+        Retries (up to ``max_retries``) on 429/502/503/504 and on
+        ``httpx.TransportError`` (connect failures, timeouts, resets): every
+        request here is an idempotent GET, so a retry can never double-apply.
+        """
         clean_params = {k: v for k, v in (params or {}).items() if v is not None}
         attempt = 0
         while True:
             try:
                 resp = await self._http.get(path, params=clean_params)
-            except httpx.HTTPError as exc:
+            except httpx.TransportError as exc:
+                if attempt < self.max_retries:
+                    await self._sleep(self._backoff_seconds(None, attempt))
+                    attempt += 1
+                    continue
                 # httpx exception reprs can embed the request (and its headers).
+                raise MercuryAPIError(
+                    f"Transport error calling GET {path} after {attempt + 1} attempts: {self._scrub(repr(exc))}",
+                    path=path,
+                ) from None
+            except httpx.HTTPError as exc:
                 raise MercuryAPIError(
                     f"HTTP error calling GET {path}: {self._scrub(repr(exc))}", path=path
                 ) from None
@@ -132,7 +166,9 @@ class MercuryClient:
                 continue
 
             if resp.status_code >= 400:
-                body = self._scrub(resp.text[:500])
+                # Scrub first, then truncate: a cut in the middle of a token
+                # would otherwise defeat the token-shape pattern.
+                body = self._scrub(resp.text)[:500]
                 raise MercuryAPIError(
                     f"Mercury returned HTTP {resp.status_code} for GET {path}: {body}",
                     status_code=resp.status_code,
@@ -146,8 +182,9 @@ class MercuryClient:
                 ) from None
 
     @staticmethod
-    def _backoff_seconds(resp: httpx.Response, attempt: int) -> float:
-        retry_after = resp.headers.get("Retry-After")
+    def _backoff_seconds(resp: httpx.Response | None, attempt: int) -> float:
+        """Honour a numeric ``Retry-After`` (capped at 60s); otherwise 0.5s * 2**attempt + jitter, capped at 16s."""
+        retry_after = resp.headers.get("Retry-After") if resp is not None else None
         if retry_after:
             try:
                 return min(float(retry_after), 60.0)

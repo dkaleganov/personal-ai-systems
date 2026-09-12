@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -79,8 +79,11 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 
 
 @pytest.fixture
-def fake_api() -> FakeMercury:
-    return FakeMercury()
+def fake_api() -> Iterator[FakeMercury]:
+    fake = FakeMercury()
+    yield fake
+    # Behavioural read-only guarantee: whatever a test did, only GETs reached the wire.
+    assert [r.method for r in fake.requests] == ["GET"] * len(fake.requests)
 
 
 @pytest.fixture

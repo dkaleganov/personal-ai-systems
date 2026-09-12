@@ -4,7 +4,7 @@ import pytest
 from mercury_multiorg_mcp.client import MercuryClient
 from mercury_multiorg_mcp.errors import MercuryAPIError
 
-from .conftest import FAKE_API_BASE, FAKE_TOKEN_MAIN, FakeMercury
+from .conftest import FAKE_API_BASE, FAKE_TOKEN_MAIN, FakeMercury, load_fixture
 
 
 async def _no_sleep(_: float) -> None:
@@ -121,16 +121,195 @@ async def test_error_body_is_redacted(fake_api):
     assert "[REDACTED]" in msg
 
 
-async def test_transport_error_is_wrapped_and_redacted():
-    def boom(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection refused", request=request)
+async def test_transport_error_is_retried_then_wrapped_and_redacted():
+    calls: list[str] = []
 
-    c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(boom), sleep=_no_sleep)
+    def boom(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        # Mimic a transport error whose message carries the request headers.
+        raise httpx.ConnectError(
+            f"connection refused; headers={{'Authorization': 'Bearer {FAKE_TOKEN_MAIN}'}}", request=request
+        )
+
+    c = MercuryClient(
+        FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(boom), sleep=_no_sleep, max_retries=2
+    )
     async with c:
         with pytest.raises(MercuryAPIError) as info:
             await c.list_accounts()
-    assert "connection refused" in str(info.value)
-    assert FAKE_TOKEN_MAIN not in str(info.value)
+    msg = str(info.value)
+    assert calls == ["GET", "GET", "GET"]  # initial + 2 retries, all GET
+    assert "after 3 attempts" in msg
+    assert "connection refused" in msg
+    assert FAKE_TOKEN_MAIN not in msg
+    assert "[REDACTED]" in msg
+
+
+async def test_transport_error_recovers_on_retry(fake_api):
+    failures = {"left": 1}
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        if failures["left"]:
+            failures["left"] -= 1
+            raise httpx.ReadTimeout("timed out", request=request)
+        return fake_api.handler(request)
+
+    c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(flaky), sleep=_no_sleep)
+    async with c:
+        accounts = await c.list_accounts()
+    assert len(accounts) == 3
+
+
+async def test_non_transport_httpx_error_is_not_retried():
+    calls = 0
+
+    def bad(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        # An httpx.HTTPError that is NOT a TransportError: wrapped, never retried.
+        raise httpx.TooManyRedirects("redirect loop", request=request)
+
+    c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(bad), sleep=_no_sleep)
+    async with c:
+        with pytest.raises(MercuryAPIError, match="redirect loop"):
+            await c.list_accounts()
+    assert calls == 1
+
+
+async def test_backoff_honours_retry_after_and_exponential_fallback(fake_api):
+    slept: list[float] = []
+
+    async def record(seconds: float) -> None:
+        slept.append(seconds)
+
+    fake_api.rate_limit_first = 3
+    fake_api.retry_after = "2"
+    c = MercuryClient(
+        FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(fake_api.handler), sleep=record
+    )
+    async with c:
+        await c.list_accounts()
+    assert slept == [2.0, 2.0, 2.0]
+
+    slept.clear()
+    fake2 = type(fake_api)()
+    fake2.rate_limit_first = 3  # no Retry-After header this time
+    c2 = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(fake2.handler), sleep=record)
+    async with c2:
+        await c2.list_accounts()
+    assert len(slept) == 3
+    for attempt, seconds in enumerate(slept):
+        base = 0.5 * (2**attempt)
+        assert base <= seconds <= base + 0.25, (attempt, seconds)
+
+
+def test_retry_after_is_capped_and_non_numeric_falls_back():
+    resp = httpx.Response(429, headers={"Retry-After": "600"})
+    assert MercuryClient._backoff_seconds(resp, 0) == 60.0
+    resp = httpx.Response(429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})
+    assert 0.5 <= MercuryClient._backoff_seconds(resp, 0) <= 0.75
+    assert MercuryClient._backoff_seconds(None, 10) <= 16.25  # capped
+
+
+async def test_error_body_is_scrubbed_before_truncation(fake_api):
+    fake_api.force_status = 403
+    # Token straddles the 500-char cut; a truncate-then-scrub order would leave a fragment.
+    fake_api.force_body = "x" * 470 + f" Authorization: Bearer {FAKE_TOKEN_MAIN}"
+    async with _client(fake_api) as c:
+        with pytest.raises(MercuryAPIError) as info:
+            await c.list_accounts()
+    msg = str(info.value)
+    assert FAKE_TOKEN_MAIN not in msg
+    assert FAKE_TOKEN_MAIN[:12] not in msg  # no partial token survives the cut
+    assert "[REDACTED]" in msg
+
+
+async def test_empty_page_returns_empty_list(fake_api):
+    fake_api.force_status = 200
+    fake_api.force_body = '{"transactions": [], "page": {"nextPage": null, "previousPage": null}}'
+    async with _client(fake_api) as c:
+        assert await c.list_transactions() == []
+    assert len(fake_api.requests) == 1
+
+
+async def test_pagination_dedupes_and_stops_when_cursor_does_not_advance():
+    """A server that keeps returning the same page with nextPage set must not loop."""
+    page = load_fixture("transactions_page1.json")
+    calls = 0
+
+    def stuck(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=page)
+
+    c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(stuck), sleep=_no_sleep)
+    async with c:
+        txns = await c.list_transactions(limit=50)
+    assert [t["id"] for t in txns] == [t["id"] for t in page["transactions"]]
+    assert calls == 2  # second page yielded nothing fresh -> stop
+
+
+async def test_pagination_is_bounded_by_max_pages(monkeypatch):
+    """A server that always has 'more' unique items stops at MAX_PAGES."""
+    import mercury_multiorg_mcp.client as client_mod
+
+    monkeypatch.setattr(client_mod, "MAX_PAGES", 3)
+    calls = 0
+
+    def endless(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        item = {"id": f"00000000-0000-4000-8000-{calls:012d}", "name": f"acct {calls}"}
+        return httpx.Response(200, json={"accounts": [item], "page": {"nextPage": item["id"], "previousPage": None}})
+
+    c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(endless), sleep=_no_sleep)
+    async with c:
+        accounts = await c.list_accounts()
+    assert calls == 3
+    assert len(accounts) == 3
+
+
+async def test_limit_equal_to_total_is_not_truncated(fake_api):
+    async with _client(fake_api) as c:
+        txns = await c.list_transactions(limit=3)
+    assert len(txns) == 3
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.mercury.com",
+        "https://api-sandbox.mercury.com/",
+        "http://localhost:8080",
+        "http://127.0.0.1:9999",
+        "http://LOCALHOST",
+    ],
+)
+def test_api_base_accepts_https_and_loopback_http(url):
+    c = MercuryClient(FAKE_TOKEN_MAIN, api_base=url)
+    assert c.base_url == url.rstrip("/") + "/api/v1"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://api.mercury.com",
+        "http://evil.example",
+        "ftp://api.mercury.com",
+        "api.mercury.com",
+        "https://api.mercury.com/api/v1",
+        "https://api.mercury.com?x=1",
+    ],
+)
+def test_api_base_rejects_non_https_and_paths(url):
+    with pytest.raises(ValueError, match="api_base"):
+        MercuryClient(FAKE_TOKEN_MAIN, api_base=url)
+
+
+def test_api_base_env_rejected_when_insecure(monkeypatch):
+    monkeypatch.setenv("MERCURY_API_BASE", "http://api.mercury.com")
+    with pytest.raises(ValueError, match="https"):
+        MercuryClient(FAKE_TOKEN_MAIN)
 
 
 async def test_unexpected_shape_raises(fake_api):
