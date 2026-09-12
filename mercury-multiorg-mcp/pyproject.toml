@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mercury-multiorg-mcp"
+version = "0.1.0"
+description = "Read-only MCP server exposing multiple Mercury organizations to one AI session, routed by explicit entity key."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Dima Kaleganov" }]
+keywords = ["mcp", "mercury", "banking", "read-only", "multi-org"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Office/Business :: Financial",
+]
+dependencies = [
+  # Official MCP Python SDK, v2 line (MCPServer). v2 is the current stable
+  # release line as of 2026-09; do not drop below 2.2 or cross 3.
+  "mcp>=2.2,<3",
+  "httpx>=0.28,<0.29",
+  "pydantic>=2.13,<3",
+  "pyyaml>=6.0,<7",
+  "python-dotenv>=1.2,<2",
+]
+
+[project.scripts]
+mercury-multiorg-mcp = "mercury_multiorg_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/dkaleganov/personal-ai-systems/tree/main/mercury-multiorg-mcp"
+Source = "https://github.com/dkaleganov/personal-ai-systems"
+
+[dependency-groups]
+dev = [
+  "pytest>=9.1,<10",
+  # anyio (already a transitive dependency via mcp) ships the pytest plugin
+  # used for async tests; it runs async fixtures in the test's own task,
+  # which the MCP client's task groups require.
+  "anyio>=4.15,<5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mercury_multiorg_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/mercury_multiorg_mcp",
+  "tests",
+  "entities.example.yaml",
+  ".env.example",
+  "README.md",
+  "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning:mercury_multiorg_mcp.*"]
+
+[tool.uv]
+# Keep the lockfile deterministic for anyone cloning the monorepo.
+package = true

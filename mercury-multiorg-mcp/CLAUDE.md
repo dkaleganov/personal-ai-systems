@@ -125,14 +125,20 @@ adversarial text and clients should treat it as untrusted.
 
 ## Stack
 
-Python 3.11+, official `mcp` Python SDK pinned `>=1.28,<2` (FastMCP
-pattern, `from mcp.server.fastmcp import FastMCP`; SDK v2 renames FastMCP
-to MCPServer — do NOT upgrade past <2 without a deliberate migration
-pass), httpx, pydantic>=2, pyyaml, python-dotenv. Pin all versions.
-Before scaffolding, read the MCP quickstart at modelcontextprotocol.io
-and the python-sdk README on GitHub; where they contradict this file,
-they win, and the discrepancy gets a code comment. Do not use the
-third-party standalone `fastmcp` package — official SDK only.
+Python 3.11+, official `mcp` Python SDK **v2 line**, pinned `>=2.2,<3`
+(`from mcp.server import MCPServer`; `@mcp.tool()`; `mcp.run(transport="stdio")`).
+Decision record: the July 2026 draft pinned `>=1.28,<2` (FastMCP) while v2
+was still in beta. On 2026-09-11 v2 was confirmed as the current stable
+release line (PyPI 2.2.0; README: "v2 ... the current stable release line",
+FastMCP renamed to MCPServer) and Phase 1 was built on it deliberately. Do
+not drop back to 1.x. Anticipated tool failures must raise
+`mcp.server.mcpserver.exceptions.ToolError` so the model sees the message;
+any other exception reaches the client only as "Error executing tool".
+httpx, pydantic>=2, pyyaml, python-dotenv. Pin all versions.
+Before scaffolding or changing SDK usage, read the MCP quickstart at
+modelcontextprotocol.io and the python-sdk README on GitHub; where they
+contradict this file, they win, and the discrepancy gets a code comment. Do
+not use the third-party standalone `fastmcp` package — official SDK only.
 
 ## Monorepo packaging rules
 

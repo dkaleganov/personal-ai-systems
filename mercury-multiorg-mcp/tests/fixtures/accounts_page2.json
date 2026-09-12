@@ -1,0 +1,25 @@
+{
+  "accounts": [
+    {
+      "id": "33333333-3333-4333-8333-333333333333",
+      "accountNumber": "000099990003",
+      "routingNumber": "021000021",
+      "name": "Acme Tax Reserve",
+      "nickname": "Taxes",
+      "legalBusinessName": "Acme Holdings Inc",
+      "kind": "checking",
+      "type": "mercury",
+      "status": "archived",
+      "createdAt": "2024-03-01T00:00:00Z",
+      "availableBalance": 0.0,
+      "currentBalance": 0.0,
+      "canReceiveTransactions": false,
+      "canSendRealTimePayments": false,
+      "dashboardLink": "https://app.mercury.example/accounts/33333333-3333-4333-8333-333333333333"
+    }
+  ],
+  "page": {
+    "nextPage": null,
+    "previousPage": "22222222-2222-4222-8222-222222222222"
+  }
+}
