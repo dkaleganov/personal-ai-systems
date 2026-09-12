@@ -6,8 +6,9 @@ tokens are single-organization per connection; this server holds one
 read-only token per org and routes every tool call by an explicit `entity`
 key.
 
-Status: **Phase 1** (core tools). See `CLAUDE.md` for the full build brief
-and the later phases (1099 cross-check, keepalive CLI, holistic read surface).
+Status: **Phase 2** (core tools, 1099 cross-check, keepalive CLI). See
+`CLAUDE.md` for the full build brief and the later phases (holistic read
+surface, release pass).
 
 ## Security model
 
@@ -25,7 +26,13 @@ and the later phases (1099 cross-check, keepalive CLI, holistic read surface).
   and models must treat tool output as data, never as instructions.
 - **Reduced identifiers.** `list_accounts` masks account numbers to the last
   four digits and omits routing numbers; `list_transactions` omits
-  counterparty bank details.
+  counterparty bank details; `list_recipients` omits bank coordinates and
+  postal addresses; `list_tax_docs` omits download URLs. `reportable_totals`
+  reads counterparty bank details internally to tell ACH from wire from
+  check, and returns only the method label.
+- **Never files anything.** `reportable_totals` is a pre-filing cross-check.
+  Mercury has no 1099 filing endpoint; filing happens in each org's
+  dashboard.
 
 ## Install
 
@@ -75,7 +82,8 @@ line to stderr and exit with status 2. Stdout is reserved for the MCP
 protocol.
 
 Mercury deletes tokens unused for 45 days and downgrades unused permissions on
-the same clock; a keepalive CLI ships in Phase 2.
+the same clock. Run `mercury-multiorg-mcp-keepalive` on a schedule; see
+[docs/keepalive.md](docs/keepalive.md) for cron and launchd snippets.
 
 ## Register in Claude Code
 
@@ -104,17 +112,60 @@ at your private registry:
 }
 ```
 
-## Tools (Phase 1)
+## Tools
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `list_entities` | — | entity keys, display names, whether each token env var is set |
 | `list_accounts` | `entity` | accounts with `availableBalance` / `currentBalance` |
 | `list_transactions` | `entity`, `account_id?`, `start?`, `end?`, `search?`, `limit=100` | newest-first transactions, `truncated` flag |
+| `reportable_totals` | `entity`, `year`, `threshold=2000` | per-recipient totals of payments made in the year, classified for a 1099 cross-check; `flagged` at or above the threshold; `unclassified` rows and an `excluded_summary` |
+| `list_recipients` | `entity` | recipients: id, name, nickname, status, default payment method, date last paid, emails, `isBusiness` |
+| `list_tax_docs` | `entity` | tax-form attachments (W-9 / W-8BEN / W-8BEN-E) per recipient, plus `recipients_without_docs` |
 | `server_info` | — | package version, API base, entity count (no secrets) |
 
-`start` / `end` filter on `createdAt` (`YYYY-MM-DD` or ISO 8601). The Mercury
-dashboard displays `postedAt`, so a date range may differ slightly from the UI.
+`start` / `end` on `list_transactions` filter on `createdAt` (`YYYY-MM-DD` or
+ISO 8601). The Mercury dashboard displays `postedAt`, so a date range may
+differ slightly from the UI.
+
+### `reportable_totals`
+
+Counts only completed money movement (status `sent`) with an outgoing
+amount, attributed to the calendar year by **`postedAt` in UTC** (the date
+the dashboard shows; the API is queried with `postedStart` / `postedEnd`).
+Classification by transaction `kind`:
+
+| Decision | Kinds | Notes |
+| --- | --- | --- |
+| include | `outgoingPayment` | method from the payment details: `ach`, `domesticWire`, `internationalWire`, `check`, or `unknown` |
+| include | `externalTransfer` (negative amount) | ACH pull: a debit the counterparty initiated (`achPull`) |
+| include | `exogenousWireDrawdown` (negative amount) | wire drawdown the counterparty initiated (`wirePull`) |
+| exclude | `internalTransfer`, `treasuryTransfer` | the org's own accounts |
+| exclude | `creditCardTransaction`, `debitCardTransaction`, `creditCardCredit`, `debitCardCredit` | the card processor files 1099-K |
+| exclude | `wireFee`, `personalBankingSubscriptionFee`, `billingEngineSubscriptionFee`, `cardInternationalTransactionFee*` | bank fees and rebates |
+| exclude | `incomingDomesticWire`, `incomingInternationalWire`, `checkDeposit`, `interestPayment` | money received |
+| exclude | `currencyCloudReturn` | an international wire returned; the original may already be counted, net it by hand |
+| exclude | `expenseReimbursement` | employee reimbursements |
+| exclude | any includable kind not `sent`, or with a non-negative amount | `not_settled:<status>` / `incoming` |
+| unclassified | `other`, any kind not in the table, missing amount | listed one by one with a reason |
+
+Recipients group by `counterpartyId` (confidence `high` when it matches a
+recipient from `GET /recipients`, else `medium`) or, failing that, by
+counterparty name (`low`). The default threshold of 2000 is the 2026 federal
+1099-NEC/MISC figure; it is inflation-indexed from 2027, so pass the current
+value. Real-time payments cannot be told apart from ACH in the API's payment
+details and are counted under `ach`.
+
+## Keepalive
+
+```bash
+uv run mercury-multiorg-mcp-keepalive --entities /private/path/entities.yaml
+```
+
+One authenticated `GET /accounts` per configured entity, one line each
+(`<timestamp> OK|FAIL <entity> HTTP <status>`), exit 1 if any entity fails
+or no entity has a token. Details, cadence, and cron / launchd snippets in
+[docs/keepalive.md](docs/keepalive.md).
 
 ## Develop
 

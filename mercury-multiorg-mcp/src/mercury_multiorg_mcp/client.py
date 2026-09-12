@@ -3,11 +3,13 @@
 Validated against the live OpenAPI at docs.mercury.com on 2026-09-11
 (``/reference/getaccounts.md``, ``/reference/listtransactions.md``,
 ``/reference/listaccounttransactions.md``, ``/docs/getting-started.md``,
-``/docs/api-token-security-policies.md``). Notes where the live docs differ
-from the July 2026 build brief are marked ``DOCS:`` below.
+``/docs/api-token-security-policies.md``) and on 2026-09-12 for Phase 2
+(``/reference/getrecipients.md``, ``/reference/getrecipient.md``,
+``/reference/listrecipientsattachments.md``). Notes where the live docs
+differ from the July 2026 build brief are marked ``DOCS:`` below.
 
 Only ``GET`` is implemented. There is no method for any endpoint that can
-change state, and :meth:`MercuryClient._get` is the single choke point for
+change state, and :meth:`MercuryClient._request` is the single choke point for
 every request, so adding a write path would have to be deliberate.
 """
 
@@ -134,11 +136,22 @@ class MercuryClient:
         return redact(text, self._token)
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        """GET ``path`` and return the decoded JSON body. See :meth:`_request`."""
+        resp = await self._request(path, params)
+        try:
+            return resp.json()
+        except ValueError:
+            raise MercuryAPIError(
+                f"Mercury returned non-JSON body for GET {path}", status_code=resp.status_code, path=path
+            ) from None
+
+    async def _request(self, path: str, params: dict[str, Any] | None = None) -> httpx.Response:
         """Perform a GET with bounded backoff. The only request method in the package.
 
-        Retries (up to ``max_retries``) on 429/502/503/504 and on
-        ``httpx.TransportError`` (connect failures, timeouts, resets): every
-        request here is an idempotent GET, so a retry can never double-apply.
+        Returns the successful (``< 400``) response. Retries (up to
+        ``max_retries``) on 429/502/503/504 and on ``httpx.TransportError``
+        (connect failures, timeouts, resets): every request here is an
+        idempotent GET, so a retry can never double-apply.
         """
         clean_params = {k: v for k, v in (params or {}).items() if v is not None}
         attempt = 0
@@ -174,12 +187,7 @@ class MercuryClient:
                     status_code=resp.status_code,
                     path=path,
                 )
-            try:
-                return resp.json()
-            except ValueError:
-                raise MercuryAPIError(
-                    f"Mercury returned non-JSON body for GET {path}", status_code=resp.status_code, path=path
-                ) from None
+            return resp
 
     @staticmethod
     def _backoff_seconds(resp: httpx.Response | None, attempt: int) -> float:
@@ -212,10 +220,14 @@ class MercuryClient:
         end: str | None = None,
         search: str | None = None,
         status: str | None = None,
-        limit: int = 100,
+        posted_start: str | None = None,
+        posted_end: str | None = None,
+        limit: int | None = 100,
         order: str = "desc",
     ) -> list[dict[str, Any]]:
         """Org-wide transactions via ``GET /transactions``, newest first by default.
+
+        ``limit=None`` walks every page (still bounded by ``MAX_PAGES``).
 
         DOCS: ``/transactions`` takes ``accountId`` as a repeatable query
         param, so per-account filtering uses the same endpoint. The separate
@@ -223,8 +235,9 @@ class MercuryClient:
         different envelope (``{"total", "transactions"}``); it is deliberately
         not used so callers see one pagination model.
         ``start``/``end`` filter on ``createdAt`` (YYYY-MM-DD or ISO 8601);
-        the dashboard shows ``postedAt``, which the API exposes as
-        ``postedStart``/``postedEnd`` (not surfaced in Phase 1).
+        the dashboard shows ``postedAt``, which the API filters with
+        ``postedStart``/``postedEnd`` (``posted_start``/``posted_end`` here;
+        used by the 1099 pass, which attributes a year by posted date).
         """
         if order not in ("asc", "desc"):
             raise ValueError("order must be 'asc' or 'desc'")
@@ -234,9 +247,40 @@ class MercuryClient:
             "end": end,
             "search": search,
             "status": status,
+            "postedStart": posted_start,
+            "postedEnd": posted_end,
             "order": order,
         }
         return await self._paginate("/transactions", "transactions", params=params, max_items=limit)
+
+    async def list_recipients(self) -> list[dict[str, Any]]:
+        """All payment recipients via ``GET /recipients`` (cursor-paginated like /accounts).
+
+        The raw objects carry bank coordinates and postal addresses; callers
+        project through an allowlist before anything leaves the server.
+        DOCS: the single-recipient endpoint is ``GET /recipient/{id}``
+        (singular), not ``/recipients/{id}`` as the brief says. It is not
+        needed here, so no client method exists for it.
+        """
+        return await self._paginate("/recipients", "recipients", params={}, max_items=None)
+
+    async def list_recipient_attachments(self) -> list[dict[str, Any]]:
+        """All recipient tax-form attachments via ``GET /recipients/attachments``.
+
+        DOCS: each item is ``{id, recipientId, fileName, formType
+        (w9|w8BEN|w8BENE|unknown|null), uploadedAt, url}``; ``url`` is a
+        presigned download link valid for 12 hours and is never surfaced.
+        """
+        return await self._paginate("/recipients/attachments", "attachments", params={}, max_items=None)
+
+    async def ping(self) -> int:
+        """One authenticated ``GET /accounts?limit=1``; returns the HTTP status.
+
+        Used by the keepalive CLI: any authenticated call resets Mercury's
+        45-day inactivity clock for the token.
+        """
+        resp = await self._request("/accounts", {"limit": 1})
+        return resp.status_code
 
     # -- pagination -------------------------------------------------------
 

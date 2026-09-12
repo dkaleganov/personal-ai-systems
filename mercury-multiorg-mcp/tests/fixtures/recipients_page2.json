@@ -1,0 +1,64 @@
+{
+  "total": 2,
+  "recipients": [
+    {
+      "id": "cccccccc-0005-4ccc-8ccc-cccccccccccc",
+      "name": "Wingtip Cleaning Co",
+      "nickname": null,
+      "status": "active",
+      "defaultPaymentMethod": "check",
+      "dateLastPaid": "2026-12-31T15:00:00Z",
+      "emails": [],
+      "contactEmail": null,
+      "isBusiness": false,
+      "inviteId": null,
+      "address": null,
+      "defaultAddress": null,
+      "checkInfo": {
+        "address": {
+          "address1": "2 Example Way",
+          "address2": null,
+          "city": "Springfield",
+          "region": "CA",
+          "postalCode": "00000",
+          "country": "US"
+        }
+      },
+      "electronicRoutingInfo": null,
+      "domesticWireRoutingInfo": null,
+      "internationalWireRoutingInfo": null,
+      "realTimePaymentRoutingInfo": null,
+      "attachments": []
+    },
+    {
+      "id": "cccccccc-0006-4ccc-8ccc-cccccccccccc",
+      "name": "Retired Vendor Inc",
+      "nickname": null,
+      "status": "deleted",
+      "defaultPaymentMethod": "ach",
+      "dateLastPaid": "2025-02-01T15:00:00Z",
+      "emails": [],
+      "contactEmail": null,
+      "isBusiness": true,
+      "inviteId": null,
+      "address": null,
+      "defaultAddress": null,
+      "checkInfo": null,
+      "electronicRoutingInfo": {
+        "accountNumber": "999966665555",
+        "routingNumber": "999999999",
+        "electronicAccountType": "businessChecking",
+        "bankName": null,
+        "address": null
+      },
+      "domesticWireRoutingInfo": null,
+      "internationalWireRoutingInfo": null,
+      "realTimePaymentRoutingInfo": null,
+      "attachments": []
+    }
+  ],
+  "page": {
+    "nextPage": null,
+    "previousPage": "cccccccc-0005-4ccc-8ccc-cccccccccccc"
+  }
+}

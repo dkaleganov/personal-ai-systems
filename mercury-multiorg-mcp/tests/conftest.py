@@ -37,6 +37,11 @@ class FakeMercury:
         self.retry_after: str | None = None
         self.force_status: int | None = None  # respond with this status to every request
         self.force_body: str = ""
+        self.fail_paths: dict[str, int] = {}  # path -> status to force for that path only
+        # When set, /transactions is served from this list with API-like
+        # filtering (postedStart/postedEnd, status) and cursor pagination,
+        # instead of the two Phase 1 page files.
+        self.transactions: list[dict[str, Any]] | None = None
         self._served = 0
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -49,10 +54,19 @@ class FakeMercury:
             return httpx.Response(self.force_status, text=self.force_body)
 
         path = request.url.path
+        if path in self.fail_paths:
+            return httpx.Response(self.fail_paths[path], json={"message": "forced failure"})
         cursor = request.url.params.get("start_after")
         if path == "/api/v1/accounts":
             page = "accounts_page2.json" if cursor else "accounts_page1.json"
             return httpx.Response(200, json=load_fixture(page))
+        if path == "/api/v1/recipients":
+            page = "recipients_page2.json" if cursor else "recipients_page1.json"
+            return httpx.Response(200, json=load_fixture(page))
+        if path == "/api/v1/recipients/attachments":
+            return httpx.Response(200, json=load_fixture("recipient_attachments_page1.json"))
+        if path == "/api/v1/transactions" and self.transactions is not None:
+            return httpx.Response(200, json=self._page_transactions(request))
         if path == "/api/v1/transactions":
             page = "transactions_page2.json" if cursor else "transactions_page1.json"
             data = load_fixture(page)
@@ -60,6 +74,37 @@ class FakeMercury:
             data["transactions"] = data["transactions"][:limit]
             return httpx.Response(200, json=data)
         return httpx.Response(404, json={"message": f"no fake route for {path}"})
+
+
+    def _page_transactions(self, request: httpx.Request) -> dict[str, Any]:
+        """Mimic GET /transactions: posted-date and status filters, then start_after + limit paging."""
+        p = request.url.params
+        rows = list(self.transactions or [])
+        posted_start, posted_end = p.get("postedStart"), p.get("postedEnd")
+        if posted_start or posted_end:
+            # The API filters on postedAt; a row without one cannot match a posted range.
+            rows = [
+                t
+                for t in rows
+                if t.get("postedAt")
+                and (not posted_start or t["postedAt"] >= posted_start)
+                and (not posted_end or t["postedAt"] <= posted_end)
+            ]
+        if "status" in p:
+            wanted = set(p.get_list("status"))
+            rows = [t for t in rows if t.get("status") in wanted]
+        if p.get("order", "asc") == "desc":
+            rows.reverse()
+        cursor = p.get("start_after")
+        if cursor:
+            ids = [t["id"] for t in rows]
+            rows = rows[ids.index(cursor) + 1 :] if cursor in ids else []
+        limit = int(p.get("limit", "1000"))
+        page, rest = rows[:limit], rows[limit:]
+        return {
+            "transactions": page,
+            "page": {"nextPage": page[-1]["id"] if rest and page else None, "previousPage": None},
+        }
 
 
 async def _no_sleep(_: float) -> None:

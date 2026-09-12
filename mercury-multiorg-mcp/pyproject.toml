@@ -33,6 +33,7 @@ dependencies = [
 
 [project.scripts]
 mercury-multiorg-mcp = "mercury_multiorg_mcp.server:main"
+mercury-multiorg-mcp-keepalive = "mercury_multiorg_mcp.keepalive:main"
 
 [project.urls]
 Homepage = "https://github.com/dkaleganov/personal-ai-systems/tree/main/mercury-multiorg-mcp"
@@ -54,6 +55,7 @@ packages = ["src/mercury_multiorg_mcp"]
 include = [
   "src/mercury_multiorg_mcp",
   "tests",
+  "docs",
   "entities.example.yaml",
   ".env.example",
   "README.md",

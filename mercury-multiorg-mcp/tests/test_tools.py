@@ -3,7 +3,6 @@
 import json
 import sys
 
-import pytest
 from mcp import Client, StdioServerParameters
 
 from mercury_multiorg_mcp import __version__
@@ -11,7 +10,15 @@ from mercury_multiorg_mcp.server import _ACCOUNT_FIELDS, _TRANSACTION_FIELDS
 
 from .conftest import EXAMPLE_REGISTRY, FAKE_API_BASE, FAKE_TOKEN_MAIN
 
-EXPECTED_TOOLS = {"list_entities", "list_accounts", "list_transactions", "server_info"}
+EXPECTED_TOOLS = {
+    "list_entities",
+    "list_accounts",
+    "list_transactions",
+    "server_info",
+    "reportable_totals",
+    "list_recipients",
+    "list_tax_docs",
+}
 
 
 def _payload(result) -> dict:
@@ -34,7 +41,7 @@ async def test_tool_inventory_and_read_only_annotations(mcp_client: Client):
         assert tool.annotations.read_only_hint is True, name
         assert tool.annotations.destructive_hint is False, name
     # entity is required with no default on every Mercury-touching tool
-    for name in ("list_accounts", "list_transactions"):
+    for name in ("list_accounts", "list_transactions", "reportable_totals", "list_recipients", "list_tax_docs"):
         schema = by_name[name].input_schema
         assert "entity" in schema["required"], name
         assert "default" not in schema["properties"]["entity"], name

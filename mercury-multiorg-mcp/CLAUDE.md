@@ -61,16 +61,59 @@ object. `accountNumber` is returned only as `accountNumberLast4`;
 numbers) are never returned. The allowlists in `server.py` enumerate every
 excluded live-schema field with a reason; extend them deliberately.
 
-Phase 2 — 1099 support:
+Phase 2 — 1099 support (built 2026-09-12):
 - `reportable_totals(entity, year, threshold=2000)`: per-recipient payment
   totals classified for 1099 purposes. Include ACH, check, wire, and intl
   wire to recipients plus ACH and wire pulls. Exclude card transactions,
   reimbursements, and internal transfers. Flag recipients at or above the
   threshold. (Default threshold 2000 = the 2026 federal 1099-NEC/MISC
   threshold; parameterized because it inflation-indexes from 2027.)
-- `list_recipients(entity)`
+- `list_recipients(entity)`: allowlist projection (id, name, nickname,
+  status, defaultPaymentMethod, dateLastPaid, emails, contactEmail,
+  isBusiness). Bank coordinates, addresses, attachments, inviteId omitted.
 - `list_tax_docs(entity)`: recipient tax-form attachment inventory via
   `GET /recipients/attachments` — i.e. which recipients have a W-9 on file
+  — joined to recipient names, plus `recipients_without_docs` (every
+  recipient of any status with no attachment). Presigned `url` omitted.
+
+Classification table for `reportable_totals` (decided Phase 2 against the
+live `TransactionKind` enum; mirrored in `classify.py` and the tool
+docstring, keep all three in sync):
+
+| Decision | Kind(s) | Label / reason |
+| --- | --- | --- |
+| include | `outgoingPayment` | payment to a recipient; method read from `details`: `internationalWireRoutingInfo` → `internationalWire`, `domesticWireRoutingInfo` → `domesticWire`, `electronicRoutingInfo` → `ach`, `address` or `checkNumber` → `check`, none → `unknown` |
+| include | `externalTransfer`, negative amount | `achPull`: counterparty-initiated ACH debit |
+| include | `exogenousWireDrawdown`, negative amount | `wirePull`: wire drawdown initiated by the counterparty |
+| exclude | `internalTransfer`, `treasuryTransfer` | `internal_transfer` |
+| exclude | `creditCardTransaction`, `debitCardTransaction`, `creditCardCredit`, `debitCardCredit` | `card`: processor files 1099-K |
+| exclude | `cardInternationalTransactionFee`, `…FeeRebate`, `…FeeReversal`, `…FeeRebateReversal`, `wireFee`, `personalBankingSubscriptionFee`, `billingEngineSubscriptionFee` | `bank_fee` |
+| exclude | `incomingDomesticWire`, `incomingInternationalWire`, `checkDeposit`, `interestPayment` | `incoming` |
+| exclude | `currencyCloudReturn` | `returned_payment`: original may already be counted; reviewer nets |
+| exclude | `expenseReimbursement` | `reimbursement` |
+| exclude | any includable/unknown kind with status ≠ `sent` | `not_settled:<status>` |
+| exclude | any includable/unknown kind with amount ≥ 0 | `incoming` |
+| exclude | `postedAt` outside the requested year | `outside_year` (defensive; API filter should already exclude) |
+| unclassified | `other` | `kind_other`: no method signal |
+| unclassified | kind not in the enum | `unknown_kind`: schema drift |
+| unclassified | amount missing/unparseable | `amount_missing` |
+
+Order of checks: kind-level exclusions first, then status, then amount
+sign, then include/unclassified. The classifier reads `details` only to
+pick the method label; no value from `details` reaches the output.
+
+Date basis (decided Phase 2): a transaction belongs to the calendar year of
+its `postedAt` in UTC, which is what the Mercury dashboard shows. The API
+is queried with `postedStart=YYYY-01-01` and `postedEnd=YYYY-12-31T23:59:59Z`
+(not the `start`/`end` params, which filter on `createdAt`), and the year
+is re-checked client-side. A settled row with no `postedAt` falls back to
+`createdAt` and is counted in `date_basis.fallback_to_createdAt_count`.
+
+Grouping: by `counterpartyId` when present (confidence `high` if it matches
+an id from `GET /recipients`, else `medium`); otherwise by whitespace- and
+case-normalised counterparty name (`low`). `recipient_id` is set only for
+the `high` case. Amounts are handled as exact cents (Decimal) and emitted
+as floats rounded to cents; `threshold` is compared in cents.
 
 Phase 3 — holistic read surface:
 - `get_org(entity)`: proxies `GET /organization`
@@ -116,6 +159,17 @@ stdio only; the server never opens a network listener.
 - Mercury has no 1099 filing endpoints; filing happens in the Mercury
   dashboard per org. This server supports the pre-filing cross-check; it
   never files.
+- Phase 2 live-doc findings (2026-09-12): `TransactionKind` has 23 values
+  (listed in `classify.py`); `TransactionStatus` is pending / sent /
+  cancelled / failed / reversed / blocked; `TransactionMethodData`
+  (`details`) carries electronic / domesticWire / internationalWire routing
+  info, a check `address`, and card info, but no real-time-payment member,
+  so RTP payments are indistinguishable from ACH and count as `ach`. The
+  single-recipient endpoint is `GET /recipient/{id}` (singular), unused.
+  `GET /recipients` and `GET /recipients/attachments` are cursor-paginated
+  with the same `start_after` model as `/accounts`; attachments carry
+  `formType` (w9 / w8BEN / w8BENE / unknown / null) and a presigned `url`
+  valid 12 hours. Recipient `PaymentMethod` includes `realTimePayment`.
 - Handle 429s with backoff; scrub `Authorization` from every error path,
   including httpx exception reprs.
 
@@ -142,7 +196,12 @@ stdio only; the server never opens a network listener.
   accepted only for `localhost` / `127.0.0.1` mocks. Anything else is a
   clean startup error (exit 2).
 - `main()` installs a redacting `logging.Filter` on the root logger and its
-  handlers so SDK ERROR tracebacks on stderr cannot carry a token.
+  handlers so SDK ERROR tracebacks on stderr cannot carry a token, routes
+  uncaught main-thread and worker-thread exceptions through the same
+  redaction (`sys.excepthook`, `threading.excepthook`; asyncio's unhandled
+  task errors go via the `asyncio` logger and are covered by the filter),
+  and sets the `httpx` / `httpcore` loggers to WARNING so per-request INFO
+  lines do not pollute client logs. The keepalive CLI does the same.
 
 ## Untrusted data
 

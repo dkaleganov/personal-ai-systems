@@ -164,3 +164,45 @@ def test_redacting_filter_survives_bad_format_strings():
     assert RedactingFilter().filter(rec) is True
     msg = rec.getMessage()
     assert FAKE_TOKEN_MAIN not in msg and "only one" in msg
+
+
+def test_uncaught_exception_hooks_are_redacted(monkeypatch, capsys):
+    import sys
+    import threading
+
+    from mercury_multiorg_mcp.server import install_redacting_excepthooks
+
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)  # restored after the test
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    install_redacting_excepthooks()
+    try:
+        raise RuntimeError(f"crash with Authorization: Bearer {FAKE_TOKEN_MAIN}")
+    except RuntimeError:
+        sys.excepthook(*sys.exc_info())
+    err = capsys.readouterr().err
+    assert "Traceback" in err and "RuntimeError" in err
+    assert FAKE_TOKEN_MAIN not in err and "[REDACTED]" in err
+
+    def worker() -> None:
+        raise ValueError(f"thread {FAKE_TOKEN_MAIN}")
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+    err = capsys.readouterr().err
+    assert "ValueError" in err and FAKE_TOKEN_MAIN not in err and "[REDACTED]" in err
+
+
+def test_main_installs_hooks_and_quiets_http_loggers(clean_env, no_run, monkeypatch):
+    import sys
+    import threading
+
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    for name in ("httpx", "httpcore"):
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
+    before = sys.excepthook
+    assert main(["--entities", str(EXAMPLE_REGISTRY)]) == 0
+    assert sys.excepthook is not before
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpcore").level == logging.WARNING
