@@ -34,7 +34,10 @@ when public (e.g. no real ABA routing numbers; use obviously fake values).
 5. Live docs beat this brief. Before writing or changing the API client,
    fetch the docs listed under API notes; note any discrepancy in a code
    comment.
-6. gitleaks on the full history before declaring any phase done.
+6. gitleaks on the full history before declaring any phase done, run from
+   the monorepo root so the root `.gitleaks.toml` applies (default rules
+   plus the `mercury-api-token` rule for `secret-token:mercury_production_…`
+   / `…_sandbox_…`): `gitleaks git --no-banner --redact .`
 
 ## Tool surface (all read-only, `entity` required, no defaults)
 
@@ -62,12 +65,15 @@ numbers) are never returned. The allowlists in `server.py` enumerate every
 excluded live-schema field with a reason; extend them deliberately.
 
 Phase 2 — 1099 support (built 2026-09-12):
-- `reportable_totals(entity, year, threshold=2000)`: per-recipient payment
+- `reportable_totals(entity, year, threshold=None)`: per-recipient payment
   totals classified for 1099 purposes. Include ACH, check, wire, and intl
-  wire to recipients plus ACH and wire pulls. Exclude card transactions,
+  wire payments to recipients and wire drawdowns. Set aside
+  `externalTransfer` and `other` debits for human review (see the table
+  below and the real-data finding). Exclude card transactions,
   reimbursements, and internal transfers. Flag recipients at or above the
-  threshold. (Default threshold 2000 = the 2026 federal 1099-NEC/MISC
-  threshold; parameterized because it inflation-indexes from 2027.)
+  threshold. (Default threshold is year-aware: 600 through tax year 2025,
+  2000 from 2026 = the federal 1099-NEC/MISC threshold; parameterized
+  because it inflation-indexes from 2027.)
 - `list_recipients(entity)`: allowlist projection (id, name, nickname,
   status, defaultPaymentMethod, dateLastPaid, emails, contactEmail,
   isBusiness). Bank coordinates, addresses, attachments, inviteId omitted.
@@ -77,43 +83,68 @@ Phase 2 — 1099 support (built 2026-09-12):
   recipient of any status with no attachment). Presigned `url` omitted.
 
 Classification table for `reportable_totals` (decided Phase 2 against the
-live `TransactionKind` enum; mirrored in `classify.py` and the tool
-docstring, keep all three in sync):
+live `TransactionKind` enum, revised after real-organization acceptance
+2026-09-12; mirrored in `classify.py`, the tool docstring, and README.md,
+keep all four in sync). The live docs define no semantics for kind values, so
+the table only asserts what the kind name itself supports. Real data
+showed negative `externalTransfer` rows were the organization's own linked
+external bank accounts and cross-organization Mercury transfers (not
+vendor debits), while genuine vendor-initiated ACH debits arrived as kind
+`other`; both now go to `needs_review` instead of `reportable_total`.
 
 | Decision | Kind(s) | Label / reason |
 | --- | --- | --- |
 | include | `outgoingPayment` | payment to a recipient; method read from `details`: `internationalWireRoutingInfo` → `internationalWire`, `domesticWireRoutingInfo` → `domesticWire`, `electronicRoutingInfo` → `ach`, `address` or `checkNumber` → `check`, none → `unknown` |
-| include | `externalTransfer`, negative amount | `achPull`: counterparty-initiated ACH debit |
-| include | `exogenousWireDrawdown`, negative amount | `wirePull`: wire drawdown initiated by the counterparty |
+| include | `exogenousWireDrawdown`, negative amount | `wireDrawdown`: wire drawdown, presumed counterparty-initiated; undocumented |
+| needs review | `externalTransfer`, negative amount | `linked_account_transfers`: own linked/external accounts and cross-org transfers; a vendor-initiated ACH debit could also appear — confirm before filing |
+| needs review | `other`, negative amount | `unlabeled_debits`: no method signal; typically vendor-initiated ACH debits or Mercury product payments — confirm |
 | exclude | `internalTransfer`, `treasuryTransfer` | `internal_transfer` |
 | exclude | `creditCardTransaction`, `debitCardTransaction`, `creditCardCredit`, `debitCardCredit` | `card`: processor files 1099-K |
 | exclude | `cardInternationalTransactionFee`, `…FeeRebate`, `…FeeReversal`, `…FeeRebateReversal`, `wireFee`, `personalBankingSubscriptionFee`, `billingEngineSubscriptionFee` | `bank_fee` |
 | exclude | `incomingDomesticWire`, `incomingInternationalWire`, `checkDeposit`, `interestPayment` | `incoming` |
 | exclude | `currencyCloudReturn` | `returned_payment`: original may already be counted; reviewer nets |
 | exclude | `expenseReimbursement` | `reimbursement` |
-| exclude | any includable/unknown kind with status ≠ `sent` | `not_settled:<status>` |
-| exclude | any includable/unknown kind with amount ≥ 0 | `incoming` |
-| exclude | `postedAt` outside the requested year | `outside_year` (defensive; API filter should already exclude) |
-| unclassified | `other` | `kind_other`: no method signal |
+| exclude | any includable, needs-review, or unclassified kind with status ≠ `sent` | `not_settled:<status>` |
+| exclude | any includable, needs-review, or unclassified kind with amount ≥ 0 | `incoming` |
+| exclude | `postedAt` outside the requested year | `outside_year` (normally the one-day padding rows) |
 | unclassified | kind not in the enum | `unknown_kind`: schema drift |
 | unclassified | amount missing/unparseable | `amount_missing` |
 
 Order of checks: kind-level exclusions first, then status, then amount
-sign, then include/unclassified. The classifier reads `details` only to
-pick the method label; no value from `details` reaches the output.
+sign, then include / needs-review / unclassified. The classifier reads
+`details` only to pick the method label; no value from `details` reaches
+the output. `needs_review` buckets are aggregated per normalised
+counterparty (display_name, counterparty_id, count, total, by_kind,
+would_flag, up to 3 sample transaction ids, and a fixed `hint` string
+chosen by bucket, plus the Mercury product-payment hint when the name
+starts with "Mercury "). `totals.needs_review_total` and
+`totals.reportable_total_upper_bound` (= reportable_total +
+needs_review_total) give the reviewer both bounds.
 
 Date basis (decided Phase 2): a transaction belongs to the calendar year of
 its `postedAt` in UTC, which is what the Mercury dashboard shows. The API
-is queried with `postedStart=YYYY-01-01` and `postedEnd=YYYY-12-31T23:59:59Z`
-(not the `start`/`end` params, which filter on `createdAt`), and the year
-is re-checked client-side. A settled row with no `postedAt` falls back to
-`createdAt` and is counted in `date_basis.fallback_to_createdAt_count`.
+is queried with `postedStart=(year-1)-12-31` and `postedEnd=(year+1)-01-02`
+(not the `start`/`end` params, which filter on `createdAt`); the boundary
+semantics of the filter are undocumented, so the window is padded and the
+year is applied client-side, with the padding rows landing in
+`excluded_summary.outside_year`. `api_filter` reports the values actually
+sent. An included row with no `postedAt` falls back to `createdAt` and is
+counted in `date_basis.fallback_to_createdAt_count`; such rows cannot be
+returned by the posted-date filter, so the count is normally 0.
+
+Threshold: `threshold` is optional; the default is year-aware (600.0 for
+tax years ≤ 2025, 2000.0 from 2026) and the resolved value is echoed.
 
 Grouping: by `counterpartyId` when present (confidence `high` if it matches
 an id from `GET /recipients`, else `medium`); otherwise by whitespace- and
 case-normalised counterparty name (`low`). `recipient_id` is set only for
-the `high` case. Amounts are handled as exact cents (Decimal) and emitted
-as floats rounded to cents; `threshold` is compared in cents.
+the `high` case. A post-pass keyed on the normalised display name across
+id-groups emits `possible_same_payee` (the other ids), `name_merged_total`,
+and `flagged_for_review` (merged total ≥ threshold), so the same payee
+under two ids is visible. Amounts are handled as exact cents (Decimal) and
+emitted as floats rounded to cents; `threshold` is compared in cents.
+Exhausting the client's `MAX_PAGES` with more pages remaining raises a
+clean `MercuryAPIError` rather than returning a short total.
 
 Phase 3 — holistic read surface:
 - `get_org(entity)`: proxies `GET /organization`
@@ -164,7 +195,8 @@ stdio only; the server never opens a network listener.
   cancelled / failed / reversed / blocked; `TransactionMethodData`
   (`details`) carries electronic / domesticWire / internationalWire routing
   info, a check `address`, and card info, but no real-time-payment member,
-  so RTP payments are indistinguishable from ACH and count as `ach`. The
+  so an RTP payment appears under `ach` or `unknown` depending on whether
+  routing details are returned for it. The
   single-recipient endpoint is `GET /recipient/{id}` (singular), unused.
   `GET /recipients` and `GET /recipients/attachments` are cursor-paginated
   with the same `start_after` model as `/accounts`; attachments carry

@@ -1,0 +1,17 @@
+# gitleaks configuration for the personal-ai-systems monorepo.
+# Extends the default ruleset with the Mercury API token shape so a real
+# token can never land in history. Run from the monorepo root:
+#   gitleaks git --no-banner --redact .
+# (gitleaks picks this file up automatically from the target directory.)
+title = "personal-ai-systems"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "mercury-api-token"
+description = "Mercury API token (production or sandbox)"
+regex = '''secret-token:mercury_(production|sandbox)_[A-Za-z0-9_-]{32,}'''
+keywords = ["secret-token:mercury"]
+# Test fixtures use the deliberately different prefix `secret-token:mercury_test_fake_`,
+# which this rule does not match, so no allowlist is needed.

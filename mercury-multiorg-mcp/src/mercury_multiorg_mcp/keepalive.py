@@ -32,7 +32,7 @@ from .errors import MercuryAPIError, MercuryMultiOrgError, MissingTokenError, Re
 from .registry import Registry
 from .server import install_redacting_excepthooks, install_redacting_logging, quiet_http_loggers
 
-ClientFactory = Callable[[str], MercuryClient]
+ClientFactory = Callable[[str, str], MercuryClient]  # (token, api_base)
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -68,7 +68,7 @@ def _one_line(text: str, limit: int = 160) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
-async def _touch(entity: str, registry: Registry, make_client: ClientFactory) -> tuple[bool, str]:
+async def _touch(entity: str, registry: Registry, make_client: ClientFactory, api_base: str) -> tuple[bool, str]:
     """Return (ok, detail) for one entity. ``detail`` is safe to print."""
     try:
         token = registry.resolve_token(entity)
@@ -77,7 +77,7 @@ async def _touch(entity: str, registry: Registry, make_client: ClientFactory) ->
     except MercuryMultiOrgError as exc:
         return False, _one_line(str(exc))
     try:
-        async with make_client(token) as client:
+        async with make_client(token, api_base) as client:
             status = await client.ping()
     except MercuryAPIError as exc:
         if exc.status_code is not None:
@@ -88,14 +88,14 @@ async def _touch(entity: str, registry: Registry, make_client: ClientFactory) ->
     return True, f"HTTP {status}"
 
 
-async def _run(registry: Registry, make_client: ClientFactory, out) -> int:
+async def _run(registry: Registry, make_client: ClientFactory, api_base: str, out) -> int:
     configured = [k for k in registry.keys if registry.token_status(k)]
     if not configured:
         print(f"{_now()} FAIL (no entity has a token configured; nothing to keep alive)", file=out)
         return EXIT_FAIL
     failures = 0
     for key in registry.keys:
-        ok, detail = await _touch(key, registry, make_client)
+        ok, detail = await _touch(key, registry, make_client, api_base)
         print(f"{_now()} {'OK' if ok else 'FAIL'} {key} {detail}", file=out)
         if not ok:
             failures += 1
@@ -118,10 +118,10 @@ def main(argv: list[str] | None = None, *, client_factory: ClientFactory | None 
     install_redacting_excepthooks()
     quiet_http_loggers()
 
-    def _default_factory(token: str) -> MercuryClient:
-        return MercuryClient(token, api_base=api_base)
+    def _default_factory(token: str, base: str) -> MercuryClient:
+        return MercuryClient(token, api_base=base)
 
-    return anyio.run(_run, registry, client_factory or _default_factory, sys.stdout)
+    return anyio.run(_run, registry, client_factory or _default_factory, api_base, sys.stdout)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -3,6 +3,7 @@
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -10,7 +11,7 @@ import pytest
 from mercury_multiorg_mcp.client import MercuryClient
 from mercury_multiorg_mcp.keepalive import EXIT_CONFIG, EXIT_FAIL, EXIT_OK, main
 
-from .conftest import EXAMPLE_REGISTRY, FAKE_API_BASE, FAKE_TOKEN_MAIN, FakeMercury
+from .conftest import EXAMPLE_REGISTRY, FAKE_TOKEN_MAIN, FakeMercury
 
 FAKE_TOKEN_OPS = "secret-token:mercury_test_fake_ops_ZYXWVUTS9876"
 LINE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z (OK|FAIL) (\S+) (.*)$")
@@ -29,8 +30,8 @@ def fake_api():
 
 @pytest.fixture
 def factory(fake_api):
-    def make(token: str) -> MercuryClient:
-        return MercuryClient(token, api_base=FAKE_API_BASE, transport=httpx.MockTransport(fake_api.handler), sleep=_no_sleep)
+    def make(token: str, api_base: str) -> MercuryClient:
+        return MercuryClient(token, api_base=api_base, transport=httpx.MockTransport(fake_api.handler), sleep=_no_sleep)
 
     return make
 
@@ -62,6 +63,27 @@ def test_all_ok(clean_env, monkeypatch, capsys, fake_api, factory):
     assert all(r.url.params["limit"] == "1" for r in fake_api.requests)
     assert fake_api.requests[0].headers["Authorization"] == f"Bearer {FAKE_TOKEN_MAIN}"
     assert fake_api.requests[1].headers["Authorization"] == f"Bearer {FAKE_TOKEN_OPS}"
+    # default host when neither --api-base nor MERCURY_API_BASE is set
+    assert all(str(r.url).startswith("https://api.mercury.com/api/v1/accounts?") for r in fake_api.requests)
+
+
+def test_api_base_flag_reaches_the_request(clean_env, monkeypatch, capsys, fake_api, factory):
+    monkeypatch.setenv("MERCURY_TOKEN_ACME_MAIN", FAKE_TOKEN_MAIN)
+    monkeypatch.setenv("MERCURY_TOKEN_ACME_OPS", FAKE_TOKEN_OPS)
+    monkeypatch.setenv("MERCURY_API_BASE", "https://api-sandbox.mercury.com")  # flag must win over the env var
+    assert main(["--entities", str(EXAMPLE_REGISTRY), "--api-base", "http://127.0.0.1:8099"], client_factory=factory) == EXIT_OK
+    lines, _ = _lines(capsys)
+    assert len(lines) == 2
+    assert all(str(r.url).startswith("http://127.0.0.1:8099/api/v1/accounts?") for r in fake_api.requests)
+
+
+def test_api_base_env_var_reaches_the_request(clean_env, monkeypatch, capsys, fake_api, factory):
+    monkeypatch.setenv("MERCURY_TOKEN_ACME_MAIN", FAKE_TOKEN_MAIN)
+    monkeypatch.setenv("MERCURY_TOKEN_ACME_OPS", FAKE_TOKEN_OPS)
+    monkeypatch.setenv("MERCURY_API_BASE", "https://api-sandbox.mercury.com")
+    assert main(["--entities", str(EXAMPLE_REGISTRY)], client_factory=factory) == EXIT_OK
+    _lines(capsys)
+    assert all(str(r.url).startswith("https://api-sandbox.mercury.com/api/v1/accounts?") for r in fake_api.requests)
 
 
 def test_one_entity_without_token_fails_but_others_still_run(clean_env, monkeypatch, capsys, fake_api, factory):
@@ -90,8 +112,8 @@ def test_transport_error_is_a_fail_line_without_token(clean_env, monkeypatch, ca
     def boom(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError(f"refused; headers={{'Authorization': 'Bearer {FAKE_TOKEN_MAIN}'}}", request=request)
 
-    def factory(token: str) -> MercuryClient:
-        return MercuryClient(token, api_base=FAKE_API_BASE, transport=httpx.MockTransport(boom), sleep=_no_sleep, max_retries=1)
+    def factory(token: str, api_base: str) -> MercuryClient:
+        return MercuryClient(token, api_base=api_base, transport=httpx.MockTransport(boom), sleep=_no_sleep, max_retries=1)
 
     assert main(["--entities", str(EXAMPLE_REGISTRY)], client_factory=factory) == EXIT_FAIL
     lines, _ = _lines(capsys)
@@ -135,15 +157,27 @@ def test_version_flag(capsys):
     assert "mercury-multiorg-mcp-keepalive" in capsys.readouterr().out
 
 
+_SUBPROCESS_ENV = {"PATH": "/usr/bin:/bin", "MERCURY_TOKEN_ACME_MAIN": "", "MERCURY_TOKEN_ACME_OPS": ""}
+
+
+def _run_subprocess(argv: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, capture_output=True, text=True, env=_SUBPROCESS_ENV, timeout=60)
+
+
 def test_module_entry_point_runs_as_subprocess():
     """`python -m mercury_multiorg_mcp.keepalive` with no tokens: one FAIL line, exit 1, nothing on the wire."""
-    env = {"PATH": "/usr/bin:/bin", "MERCURY_TOKEN_ACME_MAIN": "", "MERCURY_TOKEN_ACME_OPS": ""}
-    proc = subprocess.run(
-        [sys.executable, "-m", "mercury_multiorg_mcp.keepalive", "--entities", str(EXAMPLE_REGISTRY)],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=60,
-    )
+    proc = _run_subprocess([sys.executable, "-m", "mercury_multiorg_mcp.keepalive", "--entities", str(EXAMPLE_REGISTRY)])
     assert proc.returncode == EXIT_FAIL, proc.stderr
     assert "FAIL (no entity has a token configured" in proc.stdout
+
+
+def test_console_script_runs_as_subprocess():
+    """The `mercury-multiorg-mcp-keepalive` console script installed next to the interpreter behaves the same."""
+    script = Path(sys.executable).with_name("mercury-multiorg-mcp-keepalive")
+    assert script.is_file(), f"console script not installed at {script}; run `uv sync`"
+    proc = _run_subprocess([str(script), "--entities", str(EXAMPLE_REGISTRY)])
+    assert proc.returncode == EXIT_FAIL, proc.stderr
+    assert "FAIL (no entity has a token configured" in proc.stdout
+    assert proc.stdout.count("\n") == 1
+    proc = _run_subprocess([str(script), "--version"])
+    assert proc.returncode == 0 and "mercury-multiorg-mcp-keepalive" in proc.stdout

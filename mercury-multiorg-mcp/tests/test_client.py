@@ -249,8 +249,8 @@ async def test_pagination_dedupes_and_stops_when_cursor_does_not_advance():
     assert calls == 2  # second page yielded nothing fresh -> stop
 
 
-async def test_pagination_is_bounded_by_max_pages(monkeypatch):
-    """A server that always has 'more' unique items stops at MAX_PAGES."""
+async def test_pagination_exhausting_max_pages_is_a_clean_error(monkeypatch):
+    """A server that always has 'more' unique items: stop at MAX_PAGES and fail loudly, never a short list."""
     import mercury_multiorg_mcp.client as client_mod
 
     monkeypatch.setattr(client_mod, "MAX_PAGES", 3)
@@ -264,9 +264,53 @@ async def test_pagination_is_bounded_by_max_pages(monkeypatch):
 
     c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(endless), sleep=_no_sleep)
     async with c:
-        accounts = await c.list_accounts()
+        with pytest.raises(MercuryAPIError, match="more than 3 pages") as info:
+            await c.list_accounts()
     assert calls == 3
-    assert len(accounts) == 3
+    assert info.value.path == "/accounts"
+    assert FAKE_TOKEN_MAIN not in str(info.value)
+
+
+async def test_pagination_limit_satisfied_on_last_allowed_page_is_not_an_error(monkeypatch):
+    """max_items reached exactly on the MAX_PAGES-th page while the server still says 'more': complete, not short."""
+    import mercury_multiorg_mcp.client as client_mod
+
+    monkeypatch.setattr(client_mod, "MAX_PAGES", 3)
+    calls = 0
+
+    def endless(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        item = {"id": f"00000000-0000-4000-8000-{calls:012d}"}
+        return httpx.Response(200, json={"transactions": [item], "page": {"nextPage": item["id"], "previousPage": None}})
+
+    c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(endless), sleep=_no_sleep)
+    async with c:
+        txns = await c.list_transactions(limit=3)
+        assert len(txns) == 3 and calls == 3
+        # but a short result under a limit is still an error
+        with pytest.raises(MercuryAPIError, match="more than 3 pages"):
+            await c.list_transactions(limit=4)
+
+
+async def test_pagination_last_allowed_page_without_more_is_fine(monkeypatch):
+    """Exactly MAX_PAGES pages with the last one reporting no more is a normal result."""
+    import mercury_multiorg_mcp.client as client_mod
+
+    monkeypatch.setattr(client_mod, "MAX_PAGES", 3)
+    calls = 0
+
+    def three_pages(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        item = {"id": f"00000000-0000-4000-8000-{calls:012d}", "name": f"acct {calls}"}
+        more = item["id"] if calls < 3 else None
+        return httpx.Response(200, json={"accounts": [item], "page": {"nextPage": more, "previousPage": None}})
+
+    c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(three_pages), sleep=_no_sleep)
+    async with c:
+        accounts = await c.list_accounts()
+    assert calls == 3 and len(accounts) == 3
 
 
 async def test_limit_equal_to_total_is_not_truncated(fake_api):

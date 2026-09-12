@@ -301,7 +301,9 @@ class MercuryClient:
         actually received and ``nextPage`` is used only as a "more pages"
         signal. That is correct under either reading. Page length is not
         used as a stop signal because the server-side page cap is not
-        documented; the seen-id set and ``MAX_PAGES`` bound the loop.
+        documented; the seen-id set and ``MAX_PAGES`` bound the loop, and
+        exhausting ``MAX_PAGES`` with more pages remaining is an error rather
+        than a silently short result.
         """
         collected: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -326,6 +328,18 @@ class MercuryClient:
             cursor = fresh[-1].get("id")
             if not cursor:
                 break
+        else:
+            # Every allowed page was consumed and the server still reports
+            # more. If the caller asked for at most ``max_items`` and has
+            # them, that is a complete answer; otherwise returning the short
+            # list would silently understate a total (the 1099 walk relies on
+            # this), so fail loudly instead.
+            if max_items is None or len(collected) < max_items:
+                raise MercuryAPIError(
+                    f"GET {path} has more than {MAX_PAGES} pages ({len(collected)} items collected); "
+                    "narrow the query or raise MAX_PAGES",
+                    path=path,
+                )
         if max_items is not None:
             del collected[max_items:]
         return collected

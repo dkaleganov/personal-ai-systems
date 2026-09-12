@@ -57,18 +57,20 @@ couple of weeks.
 
 ## cron
 
+A crontab entry must be one physical line (crontab has no backslash
+continuation, and a literal `%` is turned into a newline). Every Monday
+at 09:15 local time; adjust the placeholder paths and keep the registry
+and token env vars outside any repository:
+
 ```cron
-# Every Monday 09:15 local time. Adjust the paths; keep the registry and
-# token env vars outside any repository.
-15 9 * * 1  MERCURY_ENTITIES_FILE=/private/path/entities.yaml \
-            /path/to/venv/bin/mercury-multiorg-mcp-keepalive \
-            --env-file /private/path/mercury.env \
-            >> /var/log/mercury-keepalive.log 2>&1
+15 9 * * 1 /path/to/venv/bin/mercury-multiorg-mcp-keepalive --entities /private/path/entities.yaml --env-file /private/path/mercury.env >> /path/to/logs/mercury-keepalive.log 2>&1
 ```
 
-If your tokens come from a secret manager rather than a dotenv file, wrap
-the command in whatever that tool provides to inject env vars for one
-process; the CLI only reads the environment.
+If the line gets unwieldy, point cron at a one-line wrapper script
+instead (`15 9 * * 1 /path/to/bin/mercury-keepalive.sh`) and put the
+flags in the script. If your tokens come from a secret manager rather
+than a dotenv file, wrap the command in whatever that tool provides to
+inject env vars for one process; the CLI only reads the environment.
 
 ## launchd (macOS)
 

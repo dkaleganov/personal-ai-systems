@@ -119,7 +119,7 @@ at your private registry:
 | `list_entities` | — | entity keys, display names, whether each token env var is set |
 | `list_accounts` | `entity` | accounts with `availableBalance` / `currentBalance` |
 | `list_transactions` | `entity`, `account_id?`, `start?`, `end?`, `search?`, `limit=100` | newest-first transactions, `truncated` flag |
-| `reportable_totals` | `entity`, `year`, `threshold=2000` | per-recipient totals of payments made in the year, classified for a 1099 cross-check; `flagged` at or above the threshold; `unclassified` rows and an `excluded_summary` |
+| `reportable_totals` | `entity`, `year`, `threshold?` (default 600 through 2025, 2000 from 2026) | per-recipient totals of payments made in the year, classified for a 1099 cross-check; `flagged` at or above the threshold; `needs_review` buckets, `unclassified` rows, and an `excluded_summary` |
 | `list_recipients` | `entity` | recipients: id, name, nickname, status, default payment method, date last paid, emails, `isBusiness` |
 | `list_tax_docs` | `entity` | tax-form attachments (W-9 / W-8BEN / W-8BEN-E) per recipient, plus `recipients_without_docs` |
 | `server_info` | — | package version, API base, entity count (no secrets) |
@@ -132,29 +132,83 @@ differ slightly from the UI.
 
 Counts only completed money movement (status `sent`) with an outgoing
 amount, attributed to the calendar year by **`postedAt` in UTC** (the date
-the dashboard shows; the API is queried with `postedStart` / `postedEnd`).
-Classification by transaction `kind`:
+the dashboard shows). The API is queried with `postedStart` / `postedEnd`
+padded by one day on each side; rows outside the year are dropped
+client-side and counted under `excluded_summary.outside_year`. The live
+docs define no semantics for transaction `kind`, so the table only asserts
+what the kind name supports; real-organization acceptance (September 2026)
+showed that negative `externalTransfer` rows were the organization's own
+linked external accounts and cross-org transfers, while genuine
+vendor-initiated ACH debits arrived as kind `other`. Those two kinds are
+therefore set aside for a human rather than counted.
 
 | Decision | Kinds | Notes |
 | --- | --- | --- |
 | include | `outgoingPayment` | method from the payment details: `ach`, `domesticWire`, `internationalWire`, `check`, or `unknown` |
-| include | `externalTransfer` (negative amount) | ACH pull: a debit the counterparty initiated (`achPull`) |
-| include | `exogenousWireDrawdown` (negative amount) | wire drawdown the counterparty initiated (`wirePull`) |
+| include | `exogenousWireDrawdown` (negative amount) | wire drawdown, presumed counterparty-initiated; undocumented (`wireDrawdown`) |
+| needs review | `externalTransfer` (negative amount) | `linked_account_transfers`: usually your own linked/external accounts or cross-org transfers; a vendor-initiated ACH debit could also appear |
+| needs review | `other` (negative amount) | `unlabeled_debits`: no method signal; typically vendor-initiated ACH debits or Mercury product payments |
 | exclude | `internalTransfer`, `treasuryTransfer` | the org's own accounts |
 | exclude | `creditCardTransaction`, `debitCardTransaction`, `creditCardCredit`, `debitCardCredit` | the card processor files 1099-K |
 | exclude | `wireFee`, `personalBankingSubscriptionFee`, `billingEngineSubscriptionFee`, `cardInternationalTransactionFee*` | bank fees and rebates |
 | exclude | `incomingDomesticWire`, `incomingInternationalWire`, `checkDeposit`, `interestPayment` | money received |
 | exclude | `currencyCloudReturn` | an international wire returned; the original may already be counted, net it by hand |
 | exclude | `expenseReimbursement` | employee reimbursements |
-| exclude | any includable kind not `sent`, or with a non-negative amount | `not_settled:<status>` / `incoming` |
-| unclassified | `other`, any kind not in the table, missing amount | listed one by one with a reason |
+| exclude | any includable, needs-review, or unclassified kind not `sent`, or with a non-negative amount | `not_settled:<status>` / `incoming` |
+| unclassified | any kind not in the table, or a missing amount | listed one by one with a reason |
 
 Recipients group by `counterpartyId` (confidence `high` when it matches a
 recipient from `GET /recipients`, else `medium`) or, failing that, by
-counterparty name (`low`). The default threshold of 2000 is the 2026 federal
-1099-NEC/MISC figure; it is inflation-indexed from 2027, so pass the current
-value. Real-time payments cannot be told apart from ACH in the API's payment
-details and are counted under `ach`.
+counterparty name (`low`). Id-groups that share a normalised name are
+cross-referenced so a payee split across two ids is visible. The default
+threshold is year-aware: 600 through tax year 2025, 2000 from 2026 (the
+federal 1099-NEC/MISC figure, inflation-indexed from 2027, so pass the
+current value); the resolved value is echoed. Real-time payments appear
+under `ach` or `unknown` depending on whether the API returns routing
+details for them.
+
+Returns:
+
+```text
+entity, year, threshold            resolved threshold (default depends on year)
+date_basis                         {field: "postedAt", timezone: "UTC",
+                                    fallback_to_createdAt_count, api_filter: {postedStart, postedEnd}}
+status_basis                       ["sent"]
+totals                             reportable_total, reportable_payment_count, recipient_count,
+                                   flagged_count, needs_review_total, needs_review_count,
+                                   reportable_total_upper_bound (= reportable_total + needs_review_total),
+                                   unclassified_count, transactions_scanned
+recipients[]                       display_name, recipient_id (known recipient) | null, counterparty_id | null,
+                                   grouping (counterparty_id | name | transaction), confidence (high | medium | low),
+                                   total, payment_count, by_method {label: {count, total}}, flagged,
+                                   possible_same_payee [other counterparty ids with the same normalised name],
+                                   name_merged_total, flagged_for_review
+needs_review                       {linked_account_transfers: [...], unlabeled_debits: [...]}; each entry:
+                                   display_name, counterparty_id | null, count, total, by_kind {kind: {count, total}},
+                                   would_flag (total >= threshold), sample_transaction_ids (max 3), hint (fixed string)
+unclassified[]                     id, kind, status, amount, postedAt, counterpartyName, reason
+excluded_summary                   {category: {count, amount (signed, as returned by Mercury)}}
+```
+
+`fallback_to_createdAt_count` counts included rows that had no `postedAt`
+and were placed by `createdAt` instead. Such rows cannot come back from the
+posted-date filter, so the count is normally 0. Hints are fixed strings
+chosen by kind and by a `Mercury ` name prefix; counterparty text itself
+is data, never an instruction.
+
+### `list_tax_docs`
+
+Returns:
+
+```text
+entity
+document_count, recipient_count, recipients_with_docs
+documents[]                        id, recipientId, recipientName | null, fileName (verbatim third-party text),
+                                   formType (w9 | w8BEN | w8BENE | unknown | null), uploadedAt
+recipients_without_docs[]          id, name, status   (every recipient of any status with no attachment)
+```
+
+Download URLs are never returned.
 
 ## Keepalive
 
