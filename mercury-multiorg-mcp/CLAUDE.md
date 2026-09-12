@@ -61,8 +61,9 @@ Identifier masking (decided Phase 1, applies to every phase): tool output
 is an explicit allowlist projection of the live schema, never the raw
 object. `accountNumber` is returned only as `accountNumberLast4`;
 `routingNumber` and transaction `details` (counterparty routing/account
-numbers) are never returned. The allowlists in `server.py` enumerate every
-excluded live-schema field with a reason; extend them deliberately.
+numbers) are never returned. The allowlists in
+`src/mercury_multiorg_mcp/projections.py` enumerate every excluded
+live-schema field with a reason; extend them deliberately.
 
 Phase 2 — 1099 support (built 2026-09-12):
 - `reportable_totals(entity, year, threshold=None)`: per-recipient payment
@@ -146,14 +147,44 @@ emitted as floats rounded to cents; `threshold` is compared in cents.
 Exhausting the client's `MAX_PAGES` with more pages remaining raises a
 clean `MercuryAPIError` rather than returning a short total.
 
-Phase 3 — holistic read surface:
-- `get_org(entity)`: proxies `GET /organization`
-- statements: list per account + fetch statement PDF
-- treasury: accounts, transactions, statements
-- credit accounts, card list/detail (masked data as returned by the API)
-- categories and merchants
-- AR: customers, invoices, invoice PDF
-- users; events feed
+Phase 3 — holistic read surface (built 2026-09-12; full reference in
+`docs/tools.md`; allowlists in `src/mercury_multiorg_mcp/projections.py`):
+- `get_org(entity)`: `GET /organization`; `ein` only as `einLast4`.
+- `list_statements(entity, account_id, start?, end?, limit)`: metadata
+  only (masked account number and EIN, `transactionCount`; no routing
+  number, address, download URL, or transaction list).
+  `get_statement_pdf(entity, statement_id)`: `GET /statements/{id}/pdf`
+  returned as an `EmbeddedResource` blob (application/pdf, base64), capped
+  at `MAX_DOWNLOAD_BYTES` (10 MB) by declared length and by a streaming
+  cap, never written to disk; non-PDF bodies are an error.
+- treasury: `list_treasury`, `list_treasury_transactions(entity,
+  treasury_id, start?, end?, limit)` (integer-cursor endpoint; date window
+  client-side on `canonicalDay` with an early stop), `list_treasury_statements
+  (entity, treasury_id, document_type?)` (metadata; `downloadUrl` omitted).
+- `list_credit_accounts`; `list_cards(entity, account_id?, status?, limit)`
+  and `get_card` (no PAN/CVC from the API; `expiration` dropped here).
+- `list_categories`; `list_merchants(entity, search?, limit)`.
+- AR: `list_customers` (no address), `list_invoices(entity, status?,
+  start?, end?, limit)` (no server filters; client-side after a full
+  walk; `slug` dropped), `get_invoice` (+ service period, line items),
+  `get_invoice_pdf` (blob pattern), `list_invoice_attachments` (id,
+  fileName; no URL).
+- `list_users`; `list_events(entity, since?, resource_type?, limit)`
+  (no server time filter; `since` client-side newest-first with an early
+  stop; `mergePatch`/`previousValues` re-projected through the changed
+  resource's allowlist, omitted with `patchOmitted` for unknown types);
+  `list_webhooks` (config view; `secret` never returned; `url` stripped
+  of userinfo, query string, and fragment because receiver URLs often
+  carry a capability token there; `enabled` derived from `status`).
+- Client-side windows (`since` on events, `start`/`end` on treasury
+  transactions) walk newest-first and stop at the first row older than
+  the window or once `limit + 1` rows inside it are collected, so an
+  `end`-only window never walks the whole history.
+- Every id that becomes a path segment is validated (`validate_path_id`)
+  so an argument can never redirect a request to another endpoint.
+- Tools return `list[ContentBlock]` for PDFs; SDK v2 passes content
+  blocks through unstructured (`_convert_to_content` in
+  `mcp.server.mcpserver.utilities.func_metadata`), verified 2026-09-12.
 
 keepalive is NOT a tool. It ships as a CLI entry point
 (`python -m mercury_multiorg_mcp.keepalive`) intended for cron/launchd,
@@ -202,6 +233,26 @@ stdio only; the server never opens a network listener.
   with the same `start_after` model as `/accounts`; attachments carry
   `formType` (w9 / w8BEN / w8BENE / unknown / null) and a presigned `url`
   valid 12 hours. Recipient `PaymentMethod` includes `realTimePayment`.
+- Phase 3 live-doc findings (2026-09-12): `GET /account/{id}/statements`
+  filters `start`/`end` on the period start date, max 3-month span,
+  and does not serve treasury or credit accounts; `GET /statements/{id}/pdf`
+  takes a bare uuid described as "ID for the account statement"; treasury
+  statements carry the same `AccountStatementId` type as depository
+  statements, but whether treasury ids work there is undocumented
+  (treasury statements otherwise expose only `downloadUrl`).
+  `GET /treasury/{id}/transactions` uses an integer `cursor` (not
+  `start_after`) and has no date filters. `GET /events` has no time filter
+  (`since` is client-side); `order` names no sort key (example ids are
+  time-based UUIDv1, so `desc` is taken as newest first and the early
+  stop relies on that); events live 90 days. `GET /ar/invoices` has no
+  status or date filters. For every cursor list the sort key behind
+  `order` is undocumented; truncated results keep the head of the order
+  requested (documented per tool in docs/tools.md).
+  `GET /users` items are keyed `userId`, not `id`. `GET /account/{id}/cards`
+  is the deprecated card shape; `GET /cards?accountId=` is used. The
+  invoice list schema (`ApiV1ArInvoicesData`) lacks the service-period
+  fields that the detail schema (`ApiV1ArInvoiceResponse`) has. Webhook
+  `secret` is documented as returned only on creation.
 - Handle 429s with backoff; scrub `Authorization` from every error path,
   including httpx exception reprs.
 
@@ -289,8 +340,8 @@ not use the third-party standalone `fastmcp` package — official SDK only.
    logic fully covered by fixture tests (operator hand-checks one org and
    month against the Mercury UI privately).
 3. Holistic read surface (get_org, statements + PDF, treasury, credit,
-   cards, categories, merchants, AR, users, events). Acceptance: fixture
-   tests per tool; docs/tools.md complete.
+   cards, categories, merchants, AR, users, events, webhooks). Acceptance:
+   fixture tests per tool; docs/tools.md complete. Built 2026-09-12.
 4. Release pass: README covering install, config, security model
    (including the untrusted-output warning), and tool reference; MIT (the
    monorepo LICENSE applies); gitleaks scan across full history; tag

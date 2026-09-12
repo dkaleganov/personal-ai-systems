@@ -1,0 +1,44 @@
+{
+  "statements": [
+    {
+      "id": "88888888-0001-4888-8888-888888888888",
+      "accountId": "33333333-3333-4333-8333-333333333333",
+      "documentType": "MonthlyStatement",
+      "description": "March 2026 statement",
+      "periodStart": "2026-03-01",
+      "periodEnd": "2026-03-31",
+      "creationDate": "2026-04-02T00:00:00Z",
+      "createdAt": "2026-04-02T01:00:00Z",
+      "updatedAt": "2026-04-02T01:00:00Z",
+      "downloadUrl": "https://files.mercury.example/treasury/1?X-Amz-Signature=fake"
+    },
+    {
+      "id": "88888888-0002-4888-8888-888888888888",
+      "accountId": "33333333-3333-4333-8333-333333333333",
+      "documentType": "1099",
+      "description": "2025 Form 1099",
+      "periodStart": "2025-01-01",
+      "periodEnd": "2025-12-31",
+      "creationDate": "2026-01-31T00:00:00Z",
+      "createdAt": "2026-01-31T01:00:00Z",
+      "updatedAt": "2026-01-31T01:00:00Z",
+      "downloadUrl": "https://files.mercury.example/treasury/2?X-Amz-Signature=fake"
+    },
+    {
+      "id": "88888888-0003-4888-8888-888888888888",
+      "accountId": "33333333-3333-4333-8333-333333333333",
+      "documentType": "TradeConfirmation",
+      "description": "Trade confirmation",
+      "periodStart": "2026-03-10",
+      "periodEnd": "2026-03-10",
+      "creationDate": "2026-03-11T00:00:00Z",
+      "createdAt": "2026-03-11T01:00:00Z",
+      "updatedAt": "2026-03-11T01:00:00Z",
+      "downloadUrl": "https://files.mercury.example/treasury/3?X-Amz-Signature=fake"
+    }
+  ],
+  "page": {
+    "nextPage": null,
+    "previousPage": null
+  }
+}

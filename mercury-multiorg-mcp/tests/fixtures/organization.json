@@ -1,0 +1,20 @@
+{
+  "organization": {
+    "id": "00000000-0000-4000-8000-00000000acme",
+    "legalBusinessName": "Acme Holdings Inc",
+    "dbas": [
+      {
+        "dbaName": "Acme Labs",
+        "dbaIsDefault": true
+      },
+      {
+        "dbaName": "Acme Studio",
+        "dbaIsDefault": false
+      }
+    ],
+    "ein": "00-0000042",
+    "kind": "business",
+    "subscriptionTier": "plus",
+    "billingCadence": "monthly"
+  }
+}

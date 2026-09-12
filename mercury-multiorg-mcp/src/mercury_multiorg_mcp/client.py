@@ -3,13 +3,19 @@
 Validated against the live OpenAPI at docs.mercury.com on 2026-09-11
 (``/reference/getaccounts.md``, ``/reference/listtransactions.md``,
 ``/reference/listaccounttransactions.md``, ``/docs/getting-started.md``,
-``/docs/api-token-security-policies.md``) and on 2026-09-12 for Phase 2
+``/docs/api-token-security-policies.md``), on 2026-09-12 for Phase 2
 (``/reference/getrecipients.md``, ``/reference/getrecipient.md``,
-``/reference/listrecipientsattachments.md``). Notes where the live docs
-differ from the July 2026 build brief are marked ``DOCS:`` below.
+``/reference/listrecipientsattachments.md``), and on 2026-09-12 for Phase 3
+(``getorganization``, ``getaccountstatements``, ``getstatementpdf``,
+``gettreasury``, ``gettreasurytransactions``, ``gettreasurystatements``,
+``listcredit``, ``listcards``, ``getcard``, ``listcategories``,
+``listmerchants``, ``listcustomers``, ``listinvoices``, ``getinvoice``,
+``getinvoicepdf``, ``listinvoiceattachments``, ``getusers``, ``getevents``,
+``getwebhooks``). Notes where the live docs differ from the build brief
+are marked ``DOCS:`` below.
 
 Only ``GET`` is implemented. There is no method for any endpoint that can
-change state, and :meth:`MercuryClient._request` is the single choke point for
+change state, and :meth:`MercuryClient._fetch` is the single choke point for
 every request, so adding a write path would have to be deliberate.
 """
 
@@ -17,6 +23,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlsplit
@@ -38,6 +45,20 @@ MAX_PAGE_SIZE = 1000
 MAX_PAGES = 200
 
 _RETRY_STATUSES = frozenset({429, 502, 503, 504})
+
+# Largest binary (statement / invoice PDF) the client will buffer.
+MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024
+
+# Mercury ids are UUIDs. Anything that could change the request path (a
+# slash, a dot segment, a query) is rejected before it reaches the URL.
+_PATH_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def validate_path_id(value: str, label: str) -> str:
+    """Return ``value`` if it is a safe single path segment, else raise ``ValueError``."""
+    if not isinstance(value, str) or not _PATH_ID_RE.fullmatch(value):  # fullmatch: `$` would allow a trailing newline
+        raise ValueError(f"{label} must be an id of letters, digits, '-' or '_' (got {value!r})")
+    return value
 
 
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -136,8 +157,8 @@ class MercuryClient:
         return redact(text, self._token)
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        """GET ``path`` and return the decoded JSON body. See :meth:`_request`."""
-        resp = await self._request(path, params)
+        """GET ``path`` and return the decoded JSON body. See :meth:`_fetch`."""
+        resp = await self._fetch(path, params)
         try:
             return resp.json()
         except ValueError:
@@ -146,10 +167,56 @@ class MercuryClient:
             ) from None
 
     async def _request(self, path: str, params: dict[str, Any] | None = None) -> httpx.Response:
+        """GET ``path`` with the body read; see :meth:`_fetch`."""
+        return await self._fetch(path, params)
+
+    async def _download(self, path: str, *, max_bytes: int = MAX_DOWNLOAD_BYTES) -> tuple[bytes, str]:
+        """GET a binary body (statement / invoice PDF) without ever buffering more than ``max_bytes``.
+
+        Returns ``(body, content_type)``. A ``Content-Length`` above the cap
+        fails before any body is read; a body that grows past the cap while
+        streaming fails as soon as it does.
+        """
+        resp = await self._fetch(path, None, stream=True)
+        try:
+            declared = resp.headers.get("Content-Length", "")
+            if declared.isdigit() and int(declared) > max_bytes:
+                raise MercuryAPIError(
+                    f"GET {path} is {int(declared)} bytes, above the {max_bytes}-byte limit",
+                    status_code=resp.status_code,
+                    path=path,
+                )
+            chunks: list[bytes] = []
+            size = 0
+            try:
+                async for chunk in resp.aiter_bytes():
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise MercuryAPIError(
+                            f"GET {path} exceeded the {max_bytes}-byte limit while downloading",
+                            status_code=resp.status_code,
+                            path=path,
+                        )
+                    chunks.append(chunk)
+            except httpx.HTTPError as exc:
+                # A read/reset in the middle of the body: same wrapping and
+                # scrubbing as every other transport failure. Not retried, the
+                # partial body is discarded.
+                raise MercuryAPIError(
+                    f"Transport error while downloading GET {path} after {size} bytes: {self._scrub(repr(exc))}",
+                    status_code=resp.status_code,
+                    path=path,
+                ) from None
+        finally:
+            await resp.aclose()
+        return b"".join(chunks), resp.headers.get("Content-Type", "")
+
+    async def _fetch(self, path: str, params: dict[str, Any] | None = None, *, stream: bool = False) -> httpx.Response:
         """Perform a GET with bounded backoff. The only request method in the package.
 
-        Returns the successful (``< 400``) response. Retries (up to
-        ``max_retries``) on 429/502/503/504 and on ``httpx.TransportError``
+        Returns the successful (``< 400``) response, body already read unless
+        ``stream`` is true (then the caller reads and closes it). Retries (up
+        to ``max_retries``) on 429/502/503/504 and on ``httpx.TransportError``
         (connect failures, timeouts, resets): every request here is an
         idempotent GET, so a retry can never double-apply.
         """
@@ -157,7 +224,8 @@ class MercuryClient:
         attempt = 0
         while True:
             try:
-                resp = await self._http.get(path, params=clean_params)
+                request = self._http.build_request("GET", path, params=clean_params)
+                resp = await self._http.send(request, stream=stream)
             except httpx.TransportError as exc:
                 if attempt < self.max_retries:
                     await self._sleep(self._backoff_seconds(None, attempt))
@@ -168,20 +236,33 @@ class MercuryClient:
                     f"Transport error calling GET {path} after {attempt + 1} attempts: {self._scrub(repr(exc))}",
                     path=path,
                 ) from None
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
+                # InvalidURL is not an HTTPError: it is raised by build_request
+                # for a path that cannot be encoded. No request was sent.
                 raise MercuryAPIError(
                     f"HTTP error calling GET {path}: {self._scrub(repr(exc))}", path=path
                 ) from None
 
             if resp.status_code in _RETRY_STATUSES and attempt < self.max_retries:
+                await resp.aclose()
                 await self._sleep(self._backoff_seconds(resp, attempt))
                 attempt += 1
                 continue
 
             if resp.status_code >= 400:
+                try:
+                    await resp.aread()
+                except httpx.HTTPError as exc:
+                    await resp.aclose()
+                    raise MercuryAPIError(
+                        f"Mercury returned HTTP {resp.status_code} for GET {path}; body unreadable: {self._scrub(repr(exc))}",
+                        status_code=resp.status_code,
+                        path=path,
+                    ) from None
                 # Scrub first, then truncate: a cut in the middle of a token
                 # would otherwise defeat the token-shape pattern.
                 body = self._scrub(resp.text)[:500]
+                await resp.aclose()
                 raise MercuryAPIError(
                     f"Mercury returned HTTP {resp.status_code} for GET {path}: {body}",
                     status_code=resp.status_code,
@@ -282,6 +363,226 @@ class MercuryClient:
         resp = await self._request("/accounts", {"limit": 1})
         return resp.status_code
 
+    # -- Phase 3 read endpoints -------------------------------------------
+
+    async def get_organization(self) -> dict[str, Any]:
+        """``GET /organization``: ``{"organization": {...}}`` (unwrapped here). Carries the EIN in the raw form."""
+        data = await self._get("/organization")
+        org = data.get("organization") if isinstance(data, dict) else None
+        if not isinstance(org, dict):
+            raise MercuryAPIError("Unexpected response shape from GET /organization: missing 'organization'", path="/organization")
+        return org
+
+    async def list_account_statements(
+        self, account_id: str, *, start: str | None = None, end: str | None = None, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        """``GET /account/{id}/statements``, newest first (API default ``desc``).
+
+        DOCS: ``start``/``end`` filter on the statement *period start* date
+        (YYYY-MM-DD) and may span at most 3 months; treasury and credit
+        accounts are not served by this endpoint.
+        """
+        account_id = validate_path_id(account_id, "account_id")
+        return await self._paginate(
+            f"/account/{account_id}/statements",
+            "statements",
+            params={"start": start, "end": end, "order": "desc"},
+            max_items=limit,
+        )
+
+    async def get_statement_pdf(self, statement_id: str, *, max_bytes: int = MAX_DOWNLOAD_BYTES) -> tuple[bytes, str]:
+        """``GET /statements/{id}/pdf``: binary PDF, capped. Returns ``(body, content_type)``.
+
+        DOCS: the path parameter is a bare uuid described only as "ID for the
+        account statement". Treasury statements carry ids of the same
+        ``AccountStatementId`` type as depository statements, so they *may*
+        be accepted here; the docs do not say. Treasury statements otherwise
+        expose only a ``downloadUrl``, which this package never fetches or
+        returns.
+        """
+        statement_id = validate_path_id(statement_id, "statement_id")
+        return await self._download(f"/statements/{statement_id}/pdf", max_bytes=max_bytes)
+
+    async def list_treasury(self) -> list[dict[str, Any]]:
+        """``GET /treasury``: all treasury accounts (cursor-paginated like /accounts)."""
+        return await self._paginate("/treasury", "accounts", params={}, max_items=None)
+
+    async def list_treasury_transactions(
+        self,
+        treasury_id: str,
+        *,
+        limit: int | None = None,
+        order: str = "desc",
+        stop_at: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> list[dict[str, Any]]:
+        """``GET /treasury/{id}/transactions``, newest first by default.
+
+        DOCS: this endpoint uses an *integer* ``cursor`` (the response's
+        ``cursor`` is passed back to get the next batch; null when done), not
+        the ``start_after`` id cursor of the other list endpoints, and it has
+        no date filters. Callers wanting a date window filter on
+        ``canonicalDay`` client-side; ``stop_at`` ends the walk early once
+        rows are older than wanted (rows arrive newest first).
+        """
+        treasury_id = validate_path_id(treasury_id, "treasury_id")
+        if order not in ("asc", "desc"):
+            raise ValueError("order must be 'asc' or 'desc'")
+        path = f"/treasury/{treasury_id}/transactions"
+        collected: list[dict[str, Any]] = []
+        seen: set[Any] = set()
+        cursor: int | None = None
+        for _ in range(MAX_PAGES):
+            remaining = None if limit is None else limit - len(collected)
+            if remaining is not None and remaining <= 0:
+                break
+            page_size = MAX_PAGE_SIZE if remaining is None else min(MAX_PAGE_SIZE, remaining)
+            data = await self._get(path, {"limit": page_size, "order": order, "cursor": cursor})
+            items = data.get("transactions") if isinstance(data, dict) else None
+            if not isinstance(items, list):
+                raise MercuryAPIError(f"Unexpected response shape from GET {path}: missing 'transactions' list", path=path)
+            # Same seen-id dedupe as the id-cursor walk: an overlapping page is never counted twice.
+            rows = [it for it in items if isinstance(it, dict) and it.get("id") not in seen]
+            for it in rows:
+                seen.add(it.get("id"))
+            if stop_at is not None:
+                cut = next((i for i, it in enumerate(rows) if stop_at(it)), None)
+                if cut is not None:
+                    collected.extend(rows[:cut])
+                    break
+            collected.extend(rows)
+            nxt = data.get("cursor")
+            if not rows or not isinstance(nxt, int) or isinstance(nxt, bool) or (cursor is not None and nxt <= cursor):
+                break
+            cursor = nxt
+        else:
+            if limit is None or len(collected) < limit:
+                raise MercuryAPIError(
+                    f"GET {path} has more than {MAX_PAGES} pages ({len(collected)} items collected); "
+                    "narrow the query or raise MAX_PAGES",
+                    path=path,
+                )
+        if limit is not None:
+            del collected[limit:]
+        return collected
+
+    async def list_treasury_statements(self, treasury_id: str, *, document_type: str | None = None) -> list[dict[str, Any]]:
+        """``GET /treasury/{id}/statements`` (metadata incl. tax forms; ``documentType`` filter)."""
+        treasury_id = validate_path_id(treasury_id, "treasury_id")
+        return await self._paginate(
+            f"/treasury/{treasury_id}/statements", "statements", params={"documentType": document_type}, max_items=None
+        )
+
+    async def list_credit_accounts(self) -> list[dict[str, Any]]:
+        """``GET /credit``: ``{"accounts": [...]}``, not paginated."""
+        data = await self._get("/credit")
+        items = data.get("accounts") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            raise MercuryAPIError("Unexpected response shape from GET /credit: missing 'accounts' list", path="/credit")
+        return [it for it in items if isinstance(it, dict)]
+
+    async def list_cards(
+        self,
+        *,
+        account_id: str | None = None,
+        status: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """``GET /cards`` (org-wide, cursor-paginated; ``accountId`` / ``status`` filters).
+
+        DOCS: ``GET /account/{id}/cards`` is documented as the deprecated
+        representation; the org-wide endpoint with ``accountId`` is used.
+        """
+        return await self._paginate(
+            "/cards", "cards", params={"accountId": account_id, "status": status}, max_items=limit
+        )
+
+    async def get_card(self, card_id: str) -> dict[str, Any]:
+        """``GET /cards/{id}``. Never returns PAN/CVC (those live behind the write-scoped Vault API)."""
+        card_id = validate_path_id(card_id, "card_id")
+        data = await self._get(f"/cards/{card_id}")
+        if not isinstance(data, dict):
+            raise MercuryAPIError(f"Unexpected response shape from GET /cards/{card_id}", path=f"/cards/{card_id}")
+        return data
+
+    async def list_categories(self) -> list[dict[str, Any]]:
+        """``GET /categories``: custom expense categories (cursor-paginated)."""
+        return await self._paginate("/categories", "categories", params={}, max_items=None)
+
+    async def list_merchants(self, *, search: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
+        """``GET /merchants``: priority merchants for spend controls (items under ``data``)."""
+        return await self._paginate("/merchants", "data", params={"search": search}, max_items=limit)
+
+    async def list_customers(self) -> list[dict[str, Any]]:
+        """``GET /ar/customers`` (soft-deleted customers carry ``deletedAt``)."""
+        return await self._paginate("/ar/customers", "customers", params={}, max_items=None)
+
+    async def list_invoices(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        """``GET /ar/invoices`` (cursor-paginated).
+
+        DOCS: the endpoint has no status or date filters; callers filter
+        client-side, which means walking every invoice.
+        """
+        return await self._paginate("/ar/invoices", "invoices", params={}, max_items=limit)
+
+    async def get_invoice(self, invoice_id: str) -> dict[str, Any]:
+        """``GET /ar/invoices/{id}`` including line items."""
+        invoice_id = validate_path_id(invoice_id, "invoice_id")
+        data = await self._get(f"/ar/invoices/{invoice_id}")
+        if not isinstance(data, dict):
+            raise MercuryAPIError(f"Unexpected response shape from GET /ar/invoices/{invoice_id}", path=f"/ar/invoices/{invoice_id}")
+        return data
+
+    async def get_invoice_pdf(self, invoice_id: str, *, max_bytes: int = MAX_DOWNLOAD_BYTES) -> tuple[bytes, str]:
+        """``GET /ar/invoices/{id}/pdf``: binary PDF, capped. Returns ``(body, content_type)``."""
+        invoice_id = validate_path_id(invoice_id, "invoice_id")
+        return await self._download(f"/ar/invoices/{invoice_id}/pdf", max_bytes=max_bytes)
+
+    async def list_invoice_attachments(self, invoice_id: str) -> list[dict[str, Any]]:
+        """``GET /ar/invoices/{id}/attachments``: ``{"attachments": [{id, fileName, url}]}`` (not paginated)."""
+        invoice_id = validate_path_id(invoice_id, "invoice_id")
+        path = f"/ar/invoices/{invoice_id}/attachments"
+        data = await self._get(path)
+        items = data.get("attachments") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            raise MercuryAPIError(f"Unexpected response shape from GET {path}: missing 'attachments' list", path=path)
+        return [it for it in items if isinstance(it, dict)]
+
+    async def list_users(self) -> list[dict[str, Any]]:
+        """``GET /users`` (cursor-paginated). DOCS: the item id field is ``userId``, not ``id``."""
+        return await self._paginate("/users", "users", params={}, max_items=None, id_key="userId")
+
+    async def list_events(
+        self,
+        *,
+        resource_type: str | None = None,
+        resource_id: str | None = None,
+        limit: int | None = None,
+        order: str = "desc",
+        stop_at: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> list[dict[str, Any]]:
+        """``GET /events`` (cursor-paginated; ``resourceType`` / ``resourceId`` filters).
+
+        DOCS: there is no time filter; events are kept for 90 days. ``order``
+        is documented only as asc/desc with no sort key named; the example
+        ids are time-based (UUIDv1), so ``desc`` is taken to mean newest
+        first. A ``since`` window is applied client-side on that assumption
+        by walking newest-first and stopping at the first event older than
+        wanted (``stop_at``).
+        """
+        if order not in ("asc", "desc"):
+            raise ValueError("order must be 'asc' or 'desc'")
+        return await self._paginate(
+            "/events",
+            "events",
+            params={"resourceType": resource_type, "resourceId": resource_id, "order": order},
+            max_items=limit,
+            stop_at=stop_at,
+        )
+
+    async def list_webhooks(self) -> list[dict[str, Any]]:
+        """``GET /webhooks``: endpoint configuration. ``secret`` is never returned by GET per the docs, and is dropped anyway."""
+        return await self._paginate("/webhooks", "webhooks", params={}, max_items=None)
+
     # -- pagination -------------------------------------------------------
 
     async def _paginate(
@@ -291,8 +592,14 @@ class MercuryClient:
         *,
         params: dict[str, Any],
         max_items: int | None,
+        stop_at: Callable[[dict[str, Any]], bool] | None = None,
+        id_key: str = "id",
     ) -> list[dict[str, Any]]:
         """Walk a ``start_after`` cursor until exhausted or ``max_items`` collected.
+
+        ``stop_at`` (for server-ordered streams) ends the walk at the first
+        item it accepts; that item and everything after it are dropped.
+        ``id_key`` names the item's id field (``userId`` on /users).
 
         DOCS: the OpenAPI describes ``page.nextPage`` only as an ID and
         ``start_after`` as "the ID of the item to start after (exclusive)".
@@ -317,15 +624,20 @@ class MercuryClient:
             items = data.get(items_key) if isinstance(data, dict) else None
             if not isinstance(items, list):
                 raise MercuryAPIError(f"Unexpected response shape from GET {path}: missing '{items_key}' list", path=path)
-            fresh = [it for it in items if isinstance(it, dict) and it.get("id") not in seen]
+            fresh = [it for it in items if isinstance(it, dict) and it.get(id_key) not in seen]
             for it in fresh:
-                seen.add(it["id"])
+                seen.add(it.get(id_key))
+            if stop_at is not None:
+                cut = next((i for i, it in enumerate(fresh) if stop_at(it)), None)
+                if cut is not None:
+                    collected.extend(fresh[:cut])
+                    break
             collected.extend(fresh)
             page_info = data.get("page") or {}
             has_more = bool(page_info.get("nextPage")) and bool(fresh)
             if not has_more:
                 break
-            cursor = fresh[-1].get("id")
+            cursor = fresh[-1].get(id_key)
             if not cursor:
                 break
         else:

@@ -10,15 +10,32 @@ from mercury_multiorg_mcp.server import _ACCOUNT_FIELDS, _TRANSACTION_FIELDS
 
 from .conftest import EXAMPLE_REGISTRY, FAKE_API_BASE, FAKE_TOKEN_MAIN
 
-EXPECTED_TOOLS = {
-    "list_entities",
-    "list_accounts",
-    "list_transactions",
-    "server_info",
-    "reportable_totals",
-    "list_recipients",
-    "list_tax_docs",
+PHASE1_TOOLS = {"list_entities", "list_accounts", "list_transactions", "server_info"}
+PHASE2_TOOLS = {"reportable_totals", "list_recipients", "list_tax_docs"}
+PHASE3_TOOLS = {
+    "get_org",
+    "list_statements",
+    "get_statement_pdf",
+    "list_treasury",
+    "list_treasury_transactions",
+    "list_treasury_statements",
+    "list_credit_accounts",
+    "list_cards",
+    "get_card",
+    "list_categories",
+    "list_merchants",
+    "list_customers",
+    "list_invoices",
+    "get_invoice",
+    "get_invoice_pdf",
+    "list_invoice_attachments",
+    "list_users",
+    "list_events",
+    "list_webhooks",
 }
+EXPECTED_TOOLS = PHASE1_TOOLS | PHASE2_TOOLS | PHASE3_TOOLS
+# Every tool that touches Mercury takes `entity`; only the two registry-level tools do not.
+ENTITY_TOOLS = EXPECTED_TOOLS - {"list_entities", "server_info"}
 
 
 def _payload(result) -> dict:
@@ -41,7 +58,7 @@ async def test_tool_inventory_and_read_only_annotations(mcp_client: Client):
         assert tool.annotations.read_only_hint is True, name
         assert tool.annotations.destructive_hint is False, name
     # entity is required with no default on every Mercury-touching tool
-    for name in ("list_accounts", "list_transactions", "reportable_totals", "list_recipients", "list_tax_docs"):
+    for name in sorted(ENTITY_TOOLS):
         schema = by_name[name].input_schema
         assert "entity" in schema["required"], name
         assert "default" not in schema["properties"]["entity"], name

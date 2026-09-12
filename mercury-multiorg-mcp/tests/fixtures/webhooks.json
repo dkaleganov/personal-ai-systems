@@ -1,0 +1,45 @@
+{
+  "webhooks": [
+    {
+      "id": "9a000000-0001-4a00-8a00-9a0000000000",
+      "url": "https://hooks.example/mercury?token=fake-capability-token",
+      "status": "active",
+      "eventTypes": [
+        "transaction.created",
+        "transaction.updated"
+      ],
+      "filterPaths": [
+        "transaction.status"
+      ],
+      "secret": "whsec_fake_should_never_be_returned",
+      "createdAt": "2026-01-01T00:00:00Z",
+      "updatedAt": "2026-01-01T00:00:00Z"
+    },
+    {
+      "id": "9a000000-0002-4a00-8a00-9a0000000000",
+      "url": "https://hooks.example/paused",
+      "status": "paused",
+      "eventTypes": null,
+      "filterPaths": null,
+      "secret": null,
+      "createdAt": "2026-01-02T00:00:00Z",
+      "updatedAt": "2026-02-02T00:00:00Z"
+    },
+    {
+      "id": "9a000000-0003-4a00-8a00-9a0000000000",
+      "url": "https://user:fakepass@hooks.example:8443/catch/abc#frag",
+      "status": "disabled",
+      "eventTypes": [
+        "transaction.created"
+      ],
+      "filterPaths": null,
+      "secret": null,
+      "createdAt": "2026-01-03T00:00:00Z",
+      "updatedAt": "2026-01-03T00:00:00Z"
+    }
+  ],
+  "page": {
+    "nextPage": null,
+    "previousPage": null
+  }
+}

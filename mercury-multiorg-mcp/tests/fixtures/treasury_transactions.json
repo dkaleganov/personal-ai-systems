@@ -1,0 +1,151 @@
+{
+  "transactions": [
+    {
+      "id": "77777777-0001-4777-8777-777777777777",
+      "accountId": "33333333-3333-4333-8333-333333333333",
+      "type": "dividendPosted",
+      "amount": 100.0,
+      "balance": 249999.0,
+      "canonicalDay": "2026-03-31",
+      "description": "dividendPosted example",
+      "additionalDetails": null,
+      "security": "EXAMPLE GOVT MMF",
+      "details": {
+        "creditDescription": null,
+        "depositCounterpartyId": null,
+        "feeDescription": null,
+        "manualAmendmentDescription": null,
+        "security": null,
+        "sweepDirection": null,
+        "tradeAction": null,
+        "withdrawalCounterpartyId": null
+      }
+    },
+    {
+      "id": "77777777-0002-4777-8777-777777777777",
+      "accountId": "33333333-3333-4333-8333-333333333333",
+      "type": "sweepInPosted",
+      "amount": -200.0,
+      "balance": 249998.0,
+      "canonicalDay": "2026-03-15",
+      "description": "sweepInPosted example",
+      "additionalDetails": null,
+      "security": null,
+      "details": {
+        "creditDescription": null,
+        "depositCounterpartyId": null,
+        "feeDescription": null,
+        "manualAmendmentDescription": null,
+        "security": null,
+        "sweepDirection": "in",
+        "tradeAction": null,
+        "withdrawalCounterpartyId": null
+      }
+    },
+    {
+      "id": "77777777-0003-4777-8777-777777777777",
+      "accountId": "33333333-3333-4333-8333-333333333333",
+      "type": "mercuryFeePosted",
+      "amount": 300.0,
+      "balance": 249997.0,
+      "canonicalDay": "2026-03-01",
+      "description": "mercuryFeePosted example",
+      "additionalDetails": null,
+      "security": null,
+      "details": {
+        "creditDescription": null,
+        "depositCounterpartyId": null,
+        "feeDescription": null,
+        "manualAmendmentDescription": null,
+        "security": null,
+        "sweepDirection": null,
+        "tradeAction": null,
+        "withdrawalCounterpartyId": null
+      }
+    },
+    {
+      "id": "77777777-0004-4777-8777-777777777777",
+      "accountId": "33333333-3333-4333-8333-333333333333",
+      "type": "sweepOutPosted",
+      "amount": -400.0,
+      "balance": 249996.0,
+      "canonicalDay": "2026-02-15",
+      "description": "sweepOutPosted example",
+      "additionalDetails": null,
+      "security": null,
+      "details": {
+        "creditDescription": null,
+        "depositCounterpartyId": null,
+        "feeDescription": null,
+        "manualAmendmentDescription": null,
+        "security": null,
+        "sweepDirection": null,
+        "tradeAction": null,
+        "withdrawalCounterpartyId": null
+      }
+    },
+    {
+      "id": "77777777-0005-4777-8777-777777777777",
+      "accountId": "33333333-3333-4333-8333-333333333333",
+      "type": "interestPosted",
+      "amount": 500.0,
+      "balance": 249995.0,
+      "canonicalDay": "2026-02-01",
+      "description": "interestPosted example",
+      "additionalDetails": null,
+      "security": null,
+      "details": {
+        "creditDescription": null,
+        "depositCounterpartyId": null,
+        "feeDescription": null,
+        "manualAmendmentDescription": null,
+        "security": null,
+        "sweepDirection": null,
+        "tradeAction": null,
+        "withdrawalCounterpartyId": null
+      }
+    },
+    {
+      "id": "77777777-0006-4777-8777-777777777777",
+      "accountId": "33333333-3333-4333-8333-333333333333",
+      "type": "depositComplete",
+      "amount": -600.0,
+      "balance": 249994.0,
+      "canonicalDay": "2026-01-15",
+      "description": "depositComplete example",
+      "additionalDetails": null,
+      "security": null,
+      "details": {
+        "creditDescription": null,
+        "depositCounterpartyId": "11111111-1111-4111-8111-111111111111",
+        "feeDescription": null,
+        "manualAmendmentDescription": null,
+        "security": null,
+        "sweepDirection": null,
+        "tradeAction": null,
+        "withdrawalCounterpartyId": null
+      }
+    },
+    {
+      "id": "77777777-0007-4777-8777-777777777777",
+      "accountId": "33333333-3333-4333-8333-333333333333",
+      "type": "withdrawalPosted",
+      "amount": 700.0,
+      "balance": 249993.0,
+      "canonicalDay": "2025-12-31",
+      "description": "withdrawalPosted example",
+      "additionalDetails": null,
+      "security": null,
+      "details": {
+        "creditDescription": null,
+        "depositCounterpartyId": null,
+        "feeDescription": null,
+        "manualAmendmentDescription": null,
+        "security": null,
+        "sweepDirection": null,
+        "tradeAction": null,
+        "withdrawalCounterpartyId": null
+      }
+    }
+  ]
+}

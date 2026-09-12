@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,34 @@ EXAMPLE_REGISTRY = PACKAGE_ROOT / "entities.example.yaml"
 
 FAKE_TOKEN_MAIN = "secret-token:mercury_test_fake_main_ABCDEFGH1234"
 FAKE_API_BASE = "https://api.mercury.example"
+
+# A tiny but structurally plausible PDF, served for statement and invoice downloads.
+FAKE_PDF = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
+
+# Ids the Phase 3 fixtures know about; anything else is a 404 from the fake.
+KNOWN_ACCOUNT_ID = "11111111-1111-4111-8111-111111111111"
+KNOWN_TREASURY_ID = "33333333-3333-4333-8333-333333333333"
+
+# Generic cursor-paginated list routes: path -> (fixture, items key, fixture order, filterable query params)
+_LIST_ROUTES: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
+    "/api/v1/treasury": ("treasury_accounts.json", "accounts", "asc", ()),
+    "/api/v1/cards": ("cards.json", "cards", "asc", ("accountId", "status")),
+    "/api/v1/categories": ("categories.json", "categories", "asc", ()),
+    "/api/v1/merchants": ("merchants.json", "data", "asc", ()),
+    "/api/v1/ar/customers": ("customers.json", "customers", "asc", ()),
+    "/api/v1/ar/invoices": ("invoices.json", "invoices", "asc", ()),
+    "/api/v1/users": ("users.json", "users", "asc", ()),  # items keyed by userId
+    "/api/v1/events": ("events.json", "events", "asc", ("resourceType", "resourceId")),
+    "/api/v1/webhooks": ("webhooks.json", "webhooks", "asc", ("status",)),
+}
+_ACCOUNT_STATEMENTS_RE = re.compile(r"^/api/v1/account/([^/]+)/statements$")
+_TREASURY_STATEMENTS_RE = re.compile(r"^/api/v1/treasury/([^/]+)/statements$")
+_TREASURY_TXNS_RE = re.compile(r"^/api/v1/treasury/([^/]+)/transactions$")
+_STATEMENT_PDF_RE = re.compile(r"^/api/v1/statements/([^/]+)/pdf$")
+_CARD_RE = re.compile(r"^/api/v1/cards/([^/]+)$")
+_INVOICE_RE = re.compile(r"^/api/v1/ar/invoices/([^/]+)$")
+_INVOICE_PDF_RE = re.compile(r"^/api/v1/ar/invoices/([^/]+)/pdf$")
+_INVOICE_ATTACHMENTS_RE = re.compile(r"^/api/v1/ar/invoices/([^/]+)/attachments$")
 
 
 def load_fixture(name: str) -> dict[str, Any]:
@@ -42,6 +71,10 @@ class FakeMercury:
         # filtering (postedStart/postedEnd, status) and cursor pagination,
         # instead of the two Phase 1 page files.
         self.transactions: list[dict[str, Any]] | None = None
+        # PDF download knobs
+        self.pdf_bytes: bytes = FAKE_PDF
+        self.pdf_content_type: str = "application/pdf"
+        self.pdf_send_content_length: bool = True
         self._served = 0
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -67,6 +100,9 @@ class FakeMercury:
             return httpx.Response(200, json=load_fixture("recipient_attachments_page1.json"))
         if path == "/api/v1/transactions" and self.transactions is not None:
             return httpx.Response(200, json=self._page_transactions(request))
+        phase3 = self._phase3(request, path)
+        if phase3 is not None:
+            return phase3
         if path == "/api/v1/transactions":
             page = "transactions_page2.json" if cursor else "transactions_page1.json"
             data = load_fixture(page)
@@ -75,6 +111,113 @@ class FakeMercury:
             return httpx.Response(200, json=data)
         return httpx.Response(404, json={"message": f"no fake route for {path}"})
 
+
+    # -- Phase 3 routes ----------------------------------------------------
+
+    def _phase3(self, request: httpx.Request, path: str) -> httpx.Response | None:
+        p = request.url.params
+        if path == "/api/v1/organization":
+            return httpx.Response(200, json=load_fixture("organization.json"))
+        if path == "/api/v1/credit":
+            return httpx.Response(200, json=load_fixture("credit_accounts.json"))
+        if path in _LIST_ROUTES:
+            fixture, key, natural, filters = _LIST_ROUTES[path]
+            rows = load_fixture(fixture)[key]
+            for name in filters:
+                if name in p:
+                    wanted = set(p.get_list(name))
+                    rows = [r for r in rows if r.get(name) in wanted]
+            if path == "/api/v1/merchants" and p.get("search"):
+                needle = p["search"].casefold()
+                rows = [r for r in rows if needle in r["name"].casefold()]
+            return httpx.Response(200, json=self._page(rows, key, request, natural))
+        m = _ACCOUNT_STATEMENTS_RE.match(path)
+        if m:
+            if m.group(1) != KNOWN_ACCOUNT_ID:
+                return httpx.Response(404, json={"message": "account not found"})
+            rows = load_fixture("account_statements.json")["statements"]
+            if p.get("start"):
+                rows = [r for r in rows if r["startDate"][:10] >= p["start"]]
+            if p.get("end"):
+                rows = [r for r in rows if r["startDate"][:10] <= p["end"]]
+            return httpx.Response(200, json=self._page(rows, "statements", request, "desc"))
+        m = _TREASURY_STATEMENTS_RE.match(path)
+        if m:
+            if m.group(1) != KNOWN_TREASURY_ID:
+                return httpx.Response(404, json={"message": "treasury account not found"})
+            rows = load_fixture("treasury_statements.json")["statements"]
+            if p.get("documentType"):
+                rows = [r for r in rows if r["documentType"] == p["documentType"]]
+            return httpx.Response(200, json=self._page(rows, "statements", request, "asc"))
+        m = _TREASURY_TXNS_RE.match(path)
+        if m:
+            if m.group(1) != KNOWN_TREASURY_ID:
+                return httpx.Response(404, json={"message": "treasury account not found"})
+            rows = load_fixture("treasury_transactions.json")["transactions"]  # newest first
+            if p.get("order", "desc") == "asc":
+                rows = list(reversed(rows))
+            offset = int(p.get("cursor", "0"))
+            limit = int(p.get("limit", "100"))
+            page = rows[offset : offset + limit]
+            nxt = offset + limit if offset + limit < len(rows) else None
+            return httpx.Response(200, json={"transactions": page, "cursor": nxt})
+        m = _STATEMENT_PDF_RE.match(path)
+        if m:
+            known = {r["id"] for r in load_fixture("account_statements.json")["statements"]}
+            if m.group(1) not in known:
+                return httpx.Response(404, json={"message": "statement not found"})
+            return self._pdf_response()
+        m = _CARD_RE.match(path)
+        if m:
+            for c in load_fixture("cards.json")["cards"]:
+                if c["id"] == m.group(1):
+                    return httpx.Response(200, json=c)
+            return httpx.Response(404, json={"message": "card not found"})
+        m = _INVOICE_PDF_RE.match(path)
+        if m:
+            known = {r["id"] for r in load_fixture("invoices.json")["invoices"]}
+            if m.group(1) not in known:
+                return httpx.Response(404, json={"message": "invoice not found"})
+            return self._pdf_response()
+        m = _INVOICE_ATTACHMENTS_RE.match(path)
+        if m:
+            known = {r["id"] for r in load_fixture("invoices.json")["invoices"]}
+            if m.group(1) not in known:
+                return httpx.Response(404, json={"message": "invoice not found"})
+            return httpx.Response(200, json=load_fixture("invoice_attachments.json"))
+        m = _INVOICE_RE.match(path)
+        if m:
+            detail = load_fixture("invoice_detail.json")
+            if m.group(1) == detail["id"]:
+                return httpx.Response(200, json=detail)
+            for inv in load_fixture("invoices.json")["invoices"]:
+                if inv["id"] == m.group(1):
+                    return httpx.Response(200, json={**inv, "lineItems": []})
+            return httpx.Response(404, json={"message": "invoice not found"})
+        return None
+
+    def _pdf_response(self) -> httpx.Response:
+        headers = {"Content-Type": self.pdf_content_type}
+        if self.pdf_send_content_length:
+            return httpx.Response(200, content=self.pdf_bytes, headers=headers)
+        # A streamed body carries no Content-Length, so only the streaming cap can catch it.
+        return httpx.Response(200, stream=httpx.ByteStream(self.pdf_bytes), headers=headers)
+
+    @staticmethod
+    def _page(rows: list[dict[str, Any]], key: str, request: httpx.Request, natural: str) -> dict[str, Any]:
+        """Generic id-cursor paging: honour order (relative to the fixture's natural order), start_after, limit."""
+        p = request.url.params
+        rows = list(rows)
+        if p.get("order", natural) != natural:
+            rows.reverse()
+        id_key = "userId" if key == "users" else "id"
+        cursor = p.get("start_after")
+        if cursor:
+            ids = [r[id_key] for r in rows]
+            rows = rows[ids.index(cursor) + 1 :] if cursor in ids else []
+        limit = int(p.get("limit", "1000"))
+        page, rest = rows[:limit], rows[limit:]
+        return {key: page, "page": {"nextPage": page[-1][id_key] if rest and page else None, "previousPage": None}}
 
     def _page_transactions(self, request: httpx.Request) -> dict[str, Any]:
         """Mimic GET /transactions: posted-date and status filters, then start_after + limit paging."""
