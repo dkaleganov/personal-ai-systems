@@ -60,6 +60,7 @@ include = [
   "entities.example.yaml",
   ".env.example",
   "README.md",
+  "AGENTS.md",
   "CHANGELOG.md",
   "pyproject.toml",
 ]

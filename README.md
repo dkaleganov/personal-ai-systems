@@ -25,7 +25,9 @@ AI builder, photographer, and animator on the weekends.
   banking organizations at once (the official connector binds one org
   per connection): balances, transactions, statements (PDFs opt-in),
   treasury, cards, invoices, a 1099 pre-filing cross-check, and a
-  keepalive CLI. Never a write endpoint, never a full account number.
+  keepalive CLI. Never a write endpoint; structured output masks account
+  numbers and tax ids to their last four (the opt-in PDF tools return
+  statements and invoices unredacted, by design).
 
 - **qbo-multicompany-mcp/** — Currently a build brief only (a CLAUDE.md
   design for a read-only multi-company QuickBooks Online MCP server);

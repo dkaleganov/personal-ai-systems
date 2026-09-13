@@ -37,9 +37,9 @@ from dotenv import load_dotenv
 # failure to the model with its message intact; any other exception is
 # reported to the client only as "Error executing tool <name>".
 from mcp.server import MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.types import BlobResourceContents, ContentBlock, EmbeddedResource, TextContent, ToolAnnotations
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from . import __version__
 from .classify import default_threshold, summarize, validate_threshold
@@ -52,6 +52,7 @@ from .projections import (  # noqa: F401  (re-exported for tests and callers)
     _TRANSACTION_FIELDS,
     _project,
     _project_account,
+    scalar_str,
     project_card,
     project_category,
     project_credit_account,
@@ -187,6 +188,81 @@ def _parse_since(value: str) -> datetime:
     return parsed
 
 
+# Fixed wording for pydantic error codes seen at the argument boundary. The
+# code itself is appended so an unlisted one still reads as something.
+_VALIDATION_HINTS: dict[str, str] = {
+    "missing": "required",
+    "string_type": "expected a string",
+    "int_type": "expected an integer",
+    "int_parsing": "expected an integer",
+    "int_from_float": "expected a whole number",
+    "float_type": "expected a number",
+    "float_parsing": "expected a number",
+    "bool_type": "expected a boolean",
+    "bool_parsing": "expected a boolean",
+    "none_required": "expected null",
+    "dict_type": "expected an object",
+    "list_type": "expected a list",
+    "less_than_equal": "above the allowed maximum",
+    "greater_than_equal": "below the allowed minimum",
+    "less_than": "above the allowed maximum",
+    "greater_than": "below the allowed minimum",
+    "string_too_long": "too long",
+    "string_too_short": "too short",
+    "extra_forbidden": "unknown argument",
+    "literal_error": "not one of the allowed values",
+    "enum": "not one of the allowed values",
+}
+_LOC_SEGMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$|^\d+$")
+_TOOL_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def render_validation_error(exc: ValidationError) -> str:
+    """Field path and expected type per problem, nothing else: ``year: expected an integer (int_parsing)``.
+
+    pydantic's own rendering quotes ``input_value`` (for a ``missing`` field,
+    the whole argument object), which is caller data and can be a pasted
+    secret. Only schema-derived text is kept: the field path (segments that
+    are not identifier-shaped are shown as ``?``) and the error code.
+    """
+    problems: list[str] = []
+    for err in exc.errors(include_url=False, include_input=False, include_context=False):
+        loc = ".".join(str(p) if _LOC_SEGMENT_RE.fullmatch(str(p)) else "?" for p in err.get("loc", ())) or "<arguments>"
+        code = str(err.get("type", "invalid"))
+        hint = _VALIDATION_HINTS.get(code, "invalid value")
+        problems.append(f"{loc}: {hint} ({code})")
+    return "; ".join(problems) if problems else "invalid arguments"
+
+
+class SanitizingMCPServer(MCPServer):
+    """``MCPServer`` whose argument-validation and unknown-tool errors carry no caller input (B3).
+
+    The SDK (mcp 2.2.x) validates tool arguments in ``Tool.run`` before the
+    tool body runs and reports a failure as ``ToolError(str(ValidationError))``
+    with the ``ValidationError`` as ``__cause__``; ``MCPServer.call_tool`` is
+    the public method on that path and ``_handle_call_tool`` renders whatever
+    ``call_tool`` raises with ``str()``. Overriding the public ``call_tool``
+    is the supported seam: the cause is re-rendered as field paths and
+    expected types, scrubbed, and re-raised as a ``ToolError`` with no cause.
+    ``tests/test_external_review_v011.py`` pins the SDK contract this relies
+    on and fails loudly if it changes.
+    """
+
+    async def call_tool(self, name: str, arguments: dict[str, Any], context: Any = None) -> Any:
+        try:
+            return await super().call_tool(name, arguments, context)
+        except ToolError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, ValidationError) and not isinstance(exc, UnexpectedToolError):
+                raise ToolError(
+                    redact(f"Error executing tool {name}: invalid arguments: {render_validation_error(cause)}")
+                ) from None
+            if cause is None and str(exc) == f"Unknown tool: {name}" and not _TOOL_NAME_RE.fullmatch(name):
+                # The name is caller input too; only an identifier-shaped name is echoed.
+                raise ToolError("Unknown tool") from None
+            raise
+
+
 def build_server(
     registry: Registry,
     *,
@@ -208,7 +284,7 @@ def build_server(
 
     make_client = client_factory or _default_factory
 
-    mcp = MCPServer(
+    mcp = SanitizingMCPServer(
         name=SERVER_NAME,
         version=__version__,
         instructions=INSTRUCTIONS,
@@ -264,7 +340,11 @@ def build_server(
         to their last four digits; routing numbers are not returned.
         """
         accounts = await _call(entity, lambda c: c.list_accounts())
-        return {"entity": entity, "accounts": [_project_account(a) for a in accounts]}
+        return {
+            "entity": entity,
+            "duplicates_dropped": accounts.duplicates_dropped,
+            "accounts": [_project_account(a) for a in accounts],
+        }
 
     @mcp.tool(annotations=READ_ONLY)
     async def list_transactions(
@@ -307,6 +387,7 @@ def build_server(
             "filters": {"account_id": account_id, "start": start, "end": end, "search": search, "limit": limit},
             "count": min(len(txns), limit),
             "truncated": truncated,
+            "duplicates_dropped": txns.duplicates_dropped,
             "transactions": [_project(t, _TRANSACTION_FIELDS) for t in txns[:limit]],
         }
 
@@ -397,6 +478,10 @@ def build_server(
         by_id = {r["id"]: r for r in recipients if isinstance(r.get("id"), str)}
         report = summarize(txns, year=year, threshold=resolved_threshold, recipients_by_id=by_id)
         report["date_basis"]["api_filter"] = {"postedStart": posted_start, "postedEnd": posted_end}
+        # Exact duplicate rows the walk dropped (same id, same content); a reviewer
+        # can see that the scanned count excludes them (B2).
+        report["totals"]["duplicates_dropped"] = txns.duplicates_dropped
+        report["totals"]["recipient_duplicates_dropped"] = recipients.duplicates_dropped
         return {"entity": entity, **report}
 
     @mcp.tool(annotations=READ_ONLY)
@@ -408,7 +493,12 @@ def build_server(
         """
         recipients = await _call(entity, lambda c: c.list_recipients())
         projected = [_project(r, _RECIPIENT_FIELDS) for r in recipients]
-        return {"entity": entity, "count": len(projected), "recipients": projected}
+        return {
+            "entity": entity,
+            "count": len(projected),
+            "duplicates_dropped": recipients.duplicates_dropped,
+            "recipients": projected,
+        }
 
     @mcp.tool(annotations=READ_ONLY)
     async def list_tax_docs(entity: Entity) -> dict[str, Any]:
@@ -428,23 +518,27 @@ def build_server(
             return attachments, recipients
 
         attachments, recipients = await _call(entity, fetch)
-        names = {r["id"]: r.get("name") for r in recipients if isinstance(r.get("id"), str)}
+        # Every derived value comes from a projected object, never the raw row
+        # (B4): a recipient name that arrives as an object is null here too.
+        projected = [_project(r, _RECIPIENT_FIELDS) for r in recipients]
+        names = {r["id"]: scalar_str(r.get("name")) for r in projected if isinstance(r.get("id"), str)}
         documents = []
         for a in attachments:
             doc = _project(a, _RECIPIENT_ATTACHMENT_FIELDS)
-            doc["recipientName"] = names.get(a.get("recipientId"))
+            doc["recipientName"] = names.get(scalar_str(a.get("recipientId")))
             documents.append(doc)
-        with_docs = {a.get("recipientId") for a in attachments}
+        with_docs = {scalar_str(a.get("recipientId")) for a in attachments}
         without = [
-            {"id": r.get("id"), "name": r.get("name"), "status": r.get("status")}
-            for r in recipients
-            if r.get("id") not in with_docs
+            {"id": r.get("id"), "name": scalar_str(r.get("name")), "status": scalar_str(r.get("status"))}
+            for r in projected
+            if scalar_str(r.get("id")) not in with_docs
         ]
         return {
             "entity": entity,
             "document_count": len(documents),
             "recipient_count": len(recipients),
             "recipients_with_docs": len(with_docs & set(names)),
+            "duplicates_dropped": {"attachments": attachments.duplicates_dropped, "recipients": recipients.duplicates_dropped},
             "documents": documents,
             "recipients_without_docs": without,
         }
@@ -517,6 +611,7 @@ def build_server(
             "filters": {"start": start, "end": end, "limit": limit},
             "count": min(len(rows), limit),
             "truncated": len(rows) > limit,
+            "duplicates_dropped": rows.duplicates_dropped,
             "statements": [project_statement(r) for r in rows[:limit]],
         }
 
@@ -544,7 +639,12 @@ def build_server(
     async def list_treasury(entity: Entity) -> dict[str, Any]:
         """List one organization's treasury accounts with balances, status, and monthly net returns."""
         rows = await _call(entity, lambda c: c.list_treasury())
-        return {"entity": entity, "count": len(rows), "treasury_accounts": [project_treasury_account(r) for r in rows]}
+        return {
+            "entity": entity,
+            "count": len(rows),
+            "duplicates_dropped": rows.duplicates_dropped,
+            "treasury_accounts": [project_treasury_account(r) for r in rows],
+        }
 
     @mcp.tool(annotations=READ_ONLY)
     async def list_treasury_transactions(
@@ -570,18 +670,20 @@ def build_server(
             return isinstance(day, str) and (not start or day >= start) and (not end or day <= end)
 
         windowed = bool(start or end)
-        rows = await _call(
+        walked = await _call(
             entity,
             lambda c: c.list_treasury_transactions(treasury_id, limit=None if windowed else limit + 1, order="desc"),
         )
+        rows: list[dict[str, Any]] = walked
         if windowed:
-            rows = sorted((r for r in rows if in_window(r)), key=lambda r: r["canonicalDay"], reverse=True)
+            rows = sorted((r for r in walked if in_window(r)), key=lambda r: r["canonicalDay"], reverse=True)
         return {
             "entity": entity,
             "treasury_id": treasury_id,
             "filters": {"start": start, "end": end, "limit": limit},
             "count": min(len(rows), limit),
             "truncated": len(rows) > limit,
+            "duplicates_dropped": walked.duplicates_dropped,
             "transactions": [project_treasury_transaction(r) for r in rows[:limit]],
         }
 
@@ -612,6 +714,7 @@ def build_server(
             "treasury_id": treasury_id,
             "filters": {"document_type": document_type},
             "count": len(rows),
+            "duplicates_dropped": rows.duplicates_dropped,
             "statements": [project_treasury_statement(r) for r in rows],
         }
 
@@ -642,6 +745,7 @@ def build_server(
             "filters": {"account_id": account_id, "status": status, "limit": limit},
             "count": min(len(rows), limit),
             "truncated": len(rows) > limit,
+            "duplicates_dropped": rows.duplicates_dropped,
             "cards": [project_card(r) for r in rows[:limit]],
         }
 
@@ -658,7 +762,12 @@ def build_server(
     async def list_categories(entity: Entity) -> dict[str, Any]:
         """List one organization's custom expense categories."""
         rows = await _call(entity, lambda c: c.list_categories())
-        return {"entity": entity, "count": len(rows), "categories": [project_category(r) for r in rows]}
+        return {
+            "entity": entity,
+            "count": len(rows),
+            "duplicates_dropped": rows.duplicates_dropped,
+            "categories": [project_category(r) for r in rows],
+        }
 
     @mcp.tool(annotations=READ_ONLY)
     async def list_merchants(
@@ -673,6 +782,7 @@ def build_server(
             "filters": {"search": search, "limit": limit},
             "count": min(len(rows), limit),
             "truncated": len(rows) > limit,
+            "duplicates_dropped": rows.duplicates_dropped,
             "merchants": [project_merchant(r) for r in rows[:limit]],
         }
 
@@ -680,7 +790,12 @@ def build_server(
     async def list_customers(entity: Entity) -> dict[str, Any]:
         """List accounts-receivable customers: id, name, email, and `deletedAt` for soft-deleted ones. No addresses."""
         rows = await _call(entity, lambda c: c.list_customers())
-        return {"entity": entity, "count": len(rows), "customers": [project_customer(r) for r in rows]}
+        return {
+            "entity": entity,
+            "count": len(rows),
+            "duplicates_dropped": rows.duplicates_dropped,
+            "customers": [project_customer(r) for r in rows],
+        }
 
     @mcp.tool(annotations=READ_ONLY)
     async def list_invoices(
@@ -702,7 +817,8 @@ def build_server(
         _validate_day(end, "end")
         status = _canonical_invoice_status(status)
         filtered = bool(status or start or end)
-        rows = await _call(entity, lambda c: c.list_invoices(limit=None if filtered else limit + 1))
+        walked = await _call(entity, lambda c: c.list_invoices(limit=None if filtered else limit + 1))
+        rows: list[dict[str, Any]] = walked
         if status:
             rows = [r for r in rows if isinstance(r.get("status"), str) and r["status"].casefold() == status.casefold()]
         if start:
@@ -714,6 +830,7 @@ def build_server(
             "filters": {"status": status, "start": start, "end": end, "limit": limit},
             "count": min(len(rows), limit),
             "truncated": len(rows) > limit,
+            "duplicates_dropped": walked.duplicates_dropped,
             "invoices": [project_invoice(r) for r in rows[:limit]],
         }
 
@@ -760,7 +877,12 @@ def build_server(
     async def list_users(entity: Entity) -> dict[str, Any]:
         """List one organization's users: id, first and last name, email, role."""
         rows = await _call(entity, lambda c: c.list_users())
-        return {"entity": entity, "count": len(rows), "users": [project_user(r) for r in rows]}
+        return {
+            "entity": entity,
+            "count": len(rows),
+            "duplicates_dropped": rows.duplicates_dropped,
+            "users": [project_user(r) for r in rows],
+        }
 
     @mcp.tool(annotations=READ_ONLY)
     async def list_events(
@@ -796,12 +918,13 @@ def build_server(
         def timestamp(ev: dict[str, Any]) -> datetime | None:
             return _parse_timestamp(ev.get("occurredAt"))
 
-        rows = await _call(
+        walked = await _call(
             entity,
             lambda c: c.list_events(resource_type=resource_type, limit=None if cutoff else limit + 1, order="desc"),
         )
+        rows: list[dict[str, Any]] = walked
         if cutoff is not None:
-            stamped = [(ts, r) for r in rows if (ts := timestamp(r)) is not None and ts >= cutoff]
+            stamped = [(ts, r) for r in walked if (ts := timestamp(r)) is not None and ts >= cutoff]
             stamped.sort(key=lambda pair: pair[0], reverse=True)
             rows = [r for _, r in stamped]
         return {
@@ -809,6 +932,7 @@ def build_server(
             "filters": {"since": since, "resource_type": resource_type, "limit": limit},
             "count": min(len(rows), limit),
             "truncated": len(rows) > limit,
+            "duplicates_dropped": walked.duplicates_dropped,
             "events": [project_event(r) for r in rows[:limit]],
         }
 
@@ -822,7 +946,12 @@ def build_server(
         sha256 of the full URL) keeps two hooks distinguishable.
         """
         rows = await _call(entity, lambda c: c.list_webhooks())
-        return {"entity": entity, "count": len(rows), "webhooks": [project_webhook(r) for r in rows]}
+        return {
+            "entity": entity,
+            "count": len(rows),
+            "duplicates_dropped": rows.duplicates_dropped,
+            "webhooks": [project_webhook(r) for r in rows],
+        }
 
     @mcp.tool(annotations=READ_ONLY)
     async def server_info() -> dict[str, Any]:

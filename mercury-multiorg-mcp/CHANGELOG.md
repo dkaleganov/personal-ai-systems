@@ -56,7 +56,7 @@ shrinks by two tools unless `--allow-documents` is passed.
   unrepresentable value is never coerced to zero.
 - **History note (m3).** The README hygiene statement records that the
   first Phase 1 commit's fixtures used a real, public ABA routing number as
-  sample data (replaced two commits later; no history rewrite).
+  sample data (replaced in the next commit; no history rewrite).
 - **Startup errors (m4).** A registry with a non-string top-level key, a
   non-mapping entry, an unreadable or non-UTF-8 file, or a bad `--env-file`
   exits 2 with one line on stderr for both CLIs; the redacting exception
@@ -79,6 +79,56 @@ shrinks by two tools unless `--allow-documents` is passed.
 README security model rewritten around four classes of output
 (structured fields, tool errors, free-text fields, documents);
 docs/tools.md updated for every changed tool; CLAUDE.md brief updated.
+
+### Re-validation fixes (second commit, same version)
+
+The reviewer re-validated the first 0.1.1 commit: eight of ten findings
+closed, two partial (M1, m1), two new majors, four minors, and several
+documentation corrections. All addressed before release:
+
+- **B1 (regression, major).** A missing or non-object `page`, or a
+  `nextPage` that is neither null nor an id, is `malformed pagination
+  metadata` (an `IncompletePaginationError`), never "the last page".
+  Terminal null cursors and empty final pages still complete normally.
+- **B2 (major).** Rows are deduplicated as each one is accepted, so a row
+  repeated inside a single page is dropped once (it was counted twice);
+  exact duplicates are counted in `duplicates_dropped` on every paginated
+  result and in `reportable_totals.totals` (with
+  `recipient_duplicates_dropped`); the same id with different content is a
+  `conflicting duplicate rows` error.
+- **B3 (M1 partial).** The server subclasses the SDK's `MCPServer` and
+  overrides its public `call_tool` so an argument-validation failure is
+  rendered as field path and expected type only (`year: expected an
+  integer (int_parsing)`); the SDK's own text, which quoted the caller's
+  value (including a pasted token), never reaches the client. A test pins
+  the SDK behaviour this relies on. A non-identifier tool name is no
+  longer echoed in "Unknown tool".
+- **B4 (m1 partial).** Derived outputs are scalar-projected: `list_tax_docs`
+  joins names and statuses from projected recipient objects,
+  `reportable_totals.display_name` uses the recipient name only when it is
+  a string, `unclassified` rows and sample transaction ids null any value
+  that arrives as an object or array.
+- **B5.** A negative treasury `cursor` is rejected (schema minimum 0); zero
+  and decreasing non-negative cursors still work.
+- **B6.** `token_env` and entity keys are validated with `fullmatch`, so a
+  trailing newline is rejected.
+- **B7.** A malformed registry YAML is one stderr line with the parser's
+  problem and line/column, exit 2, on both CLIs; no source snippet.
+- **B8.** The PDF envelope check ignores trailing PDF whitespace before
+  looking for `%%EOF` in the last 2 KiB and is documented as an envelope
+  check, not parsing; the bytes are returned as received.
+- **Docs.** Unwindowed events and treasury results are the API's `desc`
+  order, chronological order is guaranteed only for windowed calls; the
+  caller's invoice id appears in `get_invoice_pdf` success metadata and
+  URI (only the slug stays internal); the monorepo README qualifies the
+  masking claim for opt-in PDFs; the routing-number fixture was replaced
+  in the next commit; literal known-token scrubbing applies to values of
+  8+ characters.
+- **Vendor neutrality.** README gains "Works with any MCP client" with
+  configuration for Claude Code, Claude Desktop, Codex CLI, Cursor /
+  Windsurf / VS Code, Gemini CLI, and any stdio MCP client; `AGENTS.md`
+  at the package root points to `CLAUDE.md` as the build brief; server
+  instructions and tool descriptions are client-neutral.
 
 ## 0.1.0 (2026-09-12)
 

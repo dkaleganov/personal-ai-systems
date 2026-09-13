@@ -200,8 +200,9 @@ Phase 3 — holistic read surface (built 2026-09-12; full reference in
   v0.1.1 (M5: an out-of-order page silently dropped in-window rows). The
   cost is the whole feed.
 - `get_invoice_pdf` tries the invoice uuid path first and, on 404, the
-  invoice's `slug` (the docs disagree on which the path takes); neither
-  the slug nor the id appears in output or error text.
+  invoice's `slug` (the docs disagree on which the path takes); the slug
+  never appears anywhere, the caller's invoice id appears in the success
+  metadata and blob URI (by design), and ids in error text are masked.
 - `list_statements` validates real calendar dates and enforces Mercury's
   3-month `start`/`end` span before any request; `list_invoices` matches
   `status` case-insensitively and rejects unknown values.
@@ -416,6 +417,23 @@ not use the third-party standalone `fastmcp` package — official SDK only.
    of 0.1.0 (six majors M1-M6, four minors m1-m4, hardening). See
    CHANGELOG.md; tests in `tests/test_external_review.py` are labelled by
    finding. The reviewer's reproduction scripts live outside the repo.
+   Re-validation (same day, same version, second commit) closed B1-B8:
+   pagination envelopes validated per endpoint (`page` object required,
+   `nextPage` null or id; treasury `cursor` null or integer >= 0) and a
+   malformed one is `IncompletePaginationError("malformed pagination
+   metadata")`; rows are deduplicated as accepted (`_accept_rows`), exact
+   duplicates counted in `RowList.duplicates_dropped` and exposed on
+   every paginated result and in `reportable_totals.totals`, a repeated
+   id with different content is an error; `SanitizingMCPServer` overrides
+   the SDK's public `call_tool` so argument-validation errors carry field
+   path and expected type only (`render_validation_error`; the SDK
+   contract is pinned by a test); derived outputs (tax-doc joins,
+   display names, unclassified rows, sample ids) go through
+   `projections.scalar`/`scalar_str`; registry regexes use `fullmatch`;
+   YAML parse errors are one line (`_yaml_problem`); the PDF envelope
+   check ignores trailing PDF whitespace and is documented as an envelope
+   check. Tests in `tests/test_external_review_v011.py`. AGENTS.md at the
+   package root points agents that read that file here.
 
 ## Definition of done for public
 

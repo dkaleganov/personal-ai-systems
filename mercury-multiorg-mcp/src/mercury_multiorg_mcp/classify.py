@@ -88,6 +88,8 @@ from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
+from .projections import scalar, scalar_str
+
 SETTLED_STATUSES = frozenset({"sent"})
 
 # Largest threshold accepted (USD). Anything above it is a caller mistake, and
@@ -300,7 +302,7 @@ def _add_to_group(group: dict[str, Any], txn: dict[str, Any], label: str, amount
     group["count"] += 1
     group["by_label"][label]["count"] += 1
     group["by_label"][label]["total"] += amount
-    if len(group["sample_ids"]) < SAMPLE_IDS and txn.get("id") is not None:
+    if len(group["sample_ids"]) < SAMPLE_IDS and scalar_str(txn.get("id")):
         group["sample_ids"].append(txn.get("id"))
 
 
@@ -359,14 +361,16 @@ def summarize(
             bucket["amount"] += to_cents(txn.get("amount")) or _ZERO
             continue
         if verdict.decision == "unclassified":
+            # Diagnostic row: every field is scalar-projected (B4); a value that
+            # arrives as an object or array is reported as null, never copied.
             unclassified.append(
                 {
-                    "id": txn.get("id"),
-                    "kind": txn.get("kind"),
-                    "status": txn.get("status"),
-                    "amount": txn.get("amount"),
-                    "postedAt": txn.get("postedAt"),
-                    "counterpartyName": txn.get("counterpartyName"),
+                    "id": scalar(txn.get("id")),
+                    "kind": scalar(txn.get("kind")),
+                    "status": scalar(txn.get("status")),
+                    "amount": scalar(txn.get("amount")),
+                    "postedAt": scalar(txn.get("postedAt")),
+                    "counterpartyName": scalar(txn.get("counterpartyName")),
                     "reason": verdict.reason,
                 }
             )
@@ -396,7 +400,7 @@ def summarize(
         recipient = recipients_by_id.get(cid) if cid else None
         if recipient is not None:
             confidence = "high"
-            display = recipient.get("name") or _display_name(group)
+            display = scalar_str(recipient.get("name")) or _display_name(group)
         elif grouping == "counterparty_id":
             confidence = "medium"
             display = _display_name(group)

@@ -146,6 +146,7 @@ async def test_list_transactions_empty_result(mcp_client: Client, fake_api):
         "filters": {"account_id": None, "start": None, "end": None, "search": None, "limit": 100},
         "count": 0,
         "truncated": False,
+        "duplicates_dropped": 0,
         "transactions": [],
     }
 

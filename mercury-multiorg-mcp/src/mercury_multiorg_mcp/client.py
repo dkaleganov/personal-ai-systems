@@ -66,8 +66,10 @@ _RETRY_STATUSES = frozenset({429, 502, 503, 504})
 MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024
 # Largest JSON body the client will buffer, in wire bytes.
 MAX_JSON_BYTES = 32 * 1024 * 1024
-# Bytes at the end of a PDF body searched for the %%EOF marker.
+# Bytes at the end of a PDF body (after trailing PDF whitespace is ignored) searched for the %%EOF marker.
 PDF_EOF_WINDOW = 2048
+# PDF whitespace characters (ISO 32000-1 table 1): NUL, TAB, LF, FF, CR, SPACE.
+_PDF_WHITESPACE = b"\x00\t\n\x0c\r "
 # Content types accepted for a PDF download (parameters such as charset ignored).
 PDF_CONTENT_TYPES = frozenset({"application/pdf", "application/octet-stream"})
 
@@ -113,20 +115,67 @@ def validate_path_id(value: str, label: str) -> str:
 
 
 def validate_pdf_bytes(body: bytes, label: str, *, status_code: int | None = None, path: str | None = None) -> None:
-    """Require the ``%PDF-`` header and a trailing ``%%EOF`` marker; raise a fixed-text error otherwise.
+    """Envelope check: the ``%PDF-`` header and a ``%%EOF`` marker within the last ``PDF_EOF_WINDOW`` bytes.
 
-    This is structural validation only (a document can still be malformed
-    inside); it rejects HTML error pages, empty bodies, and truncated
-    downloads without ever quoting the body.
+    Trailing PDF whitespace (NUL, TAB, LF, FF, CR, SPACE) is ignored for the
+    marker search only; the caller keeps and returns the original bytes.
+    This is not PDF parsing: it rejects HTML error pages, empty bodies, and
+    truncated downloads without ever quoting the body, and nothing more.
     """
     if not body.startswith(b"%PDF-"):
         raise MercuryAPIError(f"{label} did not return a PDF (missing %PDF- header)", status_code=status_code, path=path)
-    if b"%%EOF" not in body[-PDF_EOF_WINDOW:]:
+    if b"%%EOF" not in body.rstrip(_PDF_WHITESPACE)[-PDF_EOF_WINDOW:]:
         raise MercuryAPIError(
             f"{label} did not return a complete PDF (no %%EOF marker in the last {PDF_EOF_WINDOW} bytes)",
             status_code=status_code,
             path=path,
         )
+
+
+class RowList(list):
+    """The rows of a paginated walk plus how many exact duplicate rows were dropped along the way.
+
+    A plain ``list`` for every caller; ``duplicates_dropped`` counts rows whose
+    id had already been accepted (within a page or across pages) and whose
+    content was identical (B2). A repeated id with *different* content is an
+    error, never a silent choice.
+    """
+
+    def __init__(self, rows: list[dict[str, Any]] = (), *, duplicates_dropped: int = 0) -> None:  # type: ignore[assignment]
+        super().__init__(rows)
+        self.duplicates_dropped = duplicates_dropped
+
+
+def _accept_rows(
+    items: list[Any], id_key: str, seen: dict[str, dict[str, Any]], label: str, path: str
+) -> tuple[list[dict[str, Any]], int]:
+    """Filter one page: dict rows only, ids deduplicated as each row is accepted, conflicts rejected.
+
+    Rows without a usable (non-empty string) id are kept as they come; they
+    cannot be deduplicated and cannot form a cursor.
+    """
+    fresh: list[dict[str, Any]] = []
+    dropped = 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        row_id = it.get(id_key)
+        if not isinstance(row_id, str) or not row_id:
+            fresh.append(it)
+            continue
+        previous = seen.get(row_id)
+        if previous is None:
+            seen[row_id] = it
+            fresh.append(it)
+        elif previous == it:
+            dropped += 1
+        else:
+            raise MercuryAPIError(
+                f"{label}: conflicting duplicate rows (the same id appeared more than once with different content); "
+                "the result cannot be trusted",
+                path=path,
+            )
+    return fresh, dropped
 
 
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -554,8 +603,8 @@ class MercuryClient:
             raise ValueError("order must be 'asc' or 'desc'")
         path = f"/treasury/{treasury_id}/transactions"
         label = endpoint_label(path)
-        collected: list[dict[str, Any]] = []
-        seen: set[Any] = set()
+        collected = RowList()
+        seen: dict[str, dict[str, Any]] = {}
         cursor: int | None = None
         for _ in range(MAX_PAGES):
             remaining = None if limit is None else limit - len(collected)
@@ -566,15 +615,23 @@ class MercuryClient:
             items = data.get("transactions") if isinstance(data, dict) else None
             if not isinstance(items, list):
                 raise MercuryAPIError(f"Unexpected response shape from {label}: missing 'transactions' list", path=path)
-            # Same seen-id dedupe as the id-cursor walk: an overlapping page is never counted twice.
-            rows = [it for it in items if isinstance(it, dict) and it.get("id") not in seen]
-            for it in rows:
-                seen.add(it.get("id"))
+            # Same dedupe as the id-cursor walk: an overlapping page, or a row
+            # repeated inside one page, is never counted twice (B2).
+            rows, dropped = _accept_rows(items, "id", seen, label, path)
             collected.extend(rows)
+            collected.duplicates_dropped += dropped
+            # DOCS: `cursor` is nullable (null when done) and, when present, a
+            # SliceSequenceNumber: integer, minimum 0. Absent means done too.
             nxt = data.get("cursor")
             if nxt is None:
                 break
-            if not isinstance(nxt, int) or isinstance(nxt, bool) or nxt == cursor or not rows:
+            if isinstance(nxt, bool) or not isinstance(nxt, int) or nxt < 0:
+                raise IncompletePaginationError(
+                    f"{label}: malformed pagination metadata ('cursor' must be null or a non-negative integer); "
+                    "incomplete pagination, the result would be partial",
+                    path=path,
+                )
+            if nxt == cursor or not rows:
                 raise IncompletePaginationError(
                     f"{label}: incomplete pagination (the API offered another page but the cursor did not advance "
                     "or the page repeated already-seen rows); the result would be partial",
@@ -769,10 +826,18 @@ class MercuryClient:
         :class:`IncompletePaginationError`; exhausting ``MAX_PAGES`` with
         more pages remaining is an error too. A partial list is never
         returned as if it were complete.
+
+        Envelope (B1): every paginated response schema requires ``page`` as
+        an object whose ``nextPage`` is an optional, nullable id. A missing
+        or non-object ``page``, or a ``nextPage`` that is neither null nor a
+        non-empty string, is malformed pagination metadata and an error;
+        "no more pages" is only ever concluded from a well-formed envelope.
+        Rows repeated inside one page are dropped as duplicates and counted
+        (B2); a repeated id with different content is an error.
         """
         label = endpoint_label(path)
-        collected: list[dict[str, Any]] = []
-        seen: set[str] = set()
+        collected = RowList()
+        seen: dict[str, dict[str, Any]] = {}
         cursor: str | None = None
         for _ in range(MAX_PAGES):
             remaining = None if max_items is None else max_items - len(collected)
@@ -783,12 +848,24 @@ class MercuryClient:
             items = data.get(items_key) if isinstance(data, dict) else None
             if not isinstance(items, list):
                 raise MercuryAPIError(f"Unexpected response shape from {label}: missing '{items_key}' list", path=path)
-            fresh = [it for it in items if isinstance(it, dict) and it.get(id_key) not in seen]
-            for it in fresh:
-                seen.add(it.get(id_key))
+            fresh, dropped = _accept_rows(items, id_key, seen, label, path)
             collected.extend(fresh)
-            page_info = data.get("page") if isinstance(data.get("page"), dict) else {}
-            if not page_info.get("nextPage"):
+            collected.duplicates_dropped += dropped
+            page_info = data.get("page")
+            if not isinstance(page_info, dict):
+                raise IncompletePaginationError(
+                    f"{label}: malformed pagination metadata ('page' missing or not an object); "
+                    "completeness cannot be established, the result would be partial",
+                    path=path,
+                )
+            next_page = page_info.get("nextPage")
+            if next_page is not None and (not isinstance(next_page, str) or not next_page):
+                raise IncompletePaginationError(
+                    f"{label}: malformed pagination metadata ('nextPage' must be null or a non-empty string); "
+                    "completeness cannot be established, the result would be partial",
+                    path=path,
+                )
+            if next_page is None:
                 break
             next_cursor = fresh[-1].get(id_key) if fresh else None
             if not fresh or not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:

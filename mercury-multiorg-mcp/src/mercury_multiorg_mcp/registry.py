@@ -35,6 +35,26 @@ TOKEN_ENV_PREFIX = "MERCURY_TOKEN_"
 _ENV_RE = re.compile(r"^MERCURY_TOKEN_[A-Z0-9_]+$")
 
 
+def _yaml_problem(exc: yaml.YAMLError) -> str:
+    """One line describing a YAML parse failure: the parser's problem and the line/column, never a source snippet.
+
+    ``str(exc)`` on a ``MarkedYAMLError`` spans several lines and quotes the
+    offending source; only ``context``, ``problem``, and the mark position
+    are kept, whitespace-collapsed (B7).
+    """
+    parts: list[str] = []
+    if isinstance(exc, yaml.MarkedYAMLError):
+        for piece in (exc.context, exc.problem):
+            if piece:
+                parts.append(" ".join(str(piece).split()))
+        mark = exc.problem_mark or exc.context_mark
+        if mark is not None:
+            parts.append(f"(line {mark.line + 1}, column {mark.column + 1})")
+    if not parts:
+        parts.append(exc.__class__.__name__)
+    return " ".join(parts)
+
+
 class EntityConfig(BaseModel):
     """One organization: its routing key, human label, and where its token lives."""
 
@@ -47,14 +67,14 @@ class EntityConfig(BaseModel):
     @field_validator("key")
     @classmethod
     def _key_shape(cls, v: str) -> str:
-        if not _KEY_RE.match(v):
+        if not _KEY_RE.fullmatch(v):  # fullmatch: `$` alone would accept a trailing newline
             raise ValueError("must be lowercase letters, digits, and underscores, starting with a letter (e.g. acme_main)")
         return v
 
     @field_validator("token_env")
     @classmethod
     def _env_shape(cls, v: str) -> str:
-        if not _ENV_RE.match(v):
+        if not _ENV_RE.fullmatch(v):  # fullmatch: `$` alone would accept a trailing newline
             raise ValueError(
                 f"must be an environment variable name starting with {TOKEN_ENV_PREFIX} "
                 "(uppercase letters, digits, underscores; e.g. MERCURY_TOKEN_ACME_MAIN)"
@@ -127,7 +147,7 @@ class Registry:
         try:
             data = yaml.safe_load(text)
         except yaml.YAMLError as exc:
-            raise RegistryError(f"Entity registry is not valid YAML ({p}): {exc}") from None
+            raise RegistryError(f"Entity registry is not valid YAML ({p}): {_yaml_problem(exc)}") from None
         except (ValueError, RecursionError, OverflowError) as exc:
             raise RegistryError(f"Entity registry could not be parsed ({p}): {exc.__class__.__name__}") from None
         return cls.from_mapping(data, source=str(p))

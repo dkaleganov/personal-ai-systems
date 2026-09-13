@@ -58,6 +58,22 @@ def _project(obj: dict[str, Any], spec: Spec) -> dict[str, Any]:
     return {k: _project_value(obj[k], sub) for k, sub in spec.items() if k in obj}
 
 
+def scalar(value: Any) -> Any:
+    """``value`` if it is a JSON scalar (string, number, boolean, null), else ``None``.
+
+    For derived outputs (joins, display names, diagnostic rows) that copy a
+    single field out of a raw object: a field documented as a scalar that
+    arrives as an object or array is replaced by ``null`` rather than
+    passed through (B4).
+    """
+    return value if value is None or isinstance(value, _SCALARS) else None
+
+
+def scalar_str(value: Any) -> str | None:
+    """``value`` if it is a string, else ``None``."""
+    return value if isinstance(value, str) else None
+
+
 # -- nested shapes (each pinned to the live OpenAPI, docs.mercury.com, fetched 2026-09-13) --
 
 # `MerchantData` (listtransactions). Nothing excluded.

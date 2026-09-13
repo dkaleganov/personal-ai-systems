@@ -39,7 +39,12 @@ traceback, and every message is fixed text. A Mercury API failure reads
 shown as `{id}`) plus a hint chosen by status; the response body is not
 read and never quoted. A transport failure names the exception class only.
 An argument problem names the argument and the expected shape, never the
-value (`card_id: invalid id format`, `start must be YYYY-MM-DD`). API and
+value (`card_id: invalid id format`, `start must be YYYY-MM-DD`). An
+argument that fails the MCP SDK's schema validation before the tool runs
+(a wrong type, a missing required argument) is rendered by this server as
+`invalid arguments: <field>: <expected type> (<pydantic code>)`, for
+example `year: expected an integer (int_parsing)`; the SDK's own text,
+which quotes the value, never reaches the client. API and
 argument errors raised while a client is bound are prefixed `[<entity>]`;
 argument validation that happens before any request (dates, spans, enums,
 `since`, `threshold`) is not prefixed. A registry problem never echoes the
@@ -62,7 +67,16 @@ Every walk is bounded at 200 pages of 1000; exhausting it with more pages
 remaining is an error. A page that contributes no fresh rows, yields no
 usable cursor, or does not advance the cursor while the API still
 advertises another page is an `incomplete pagination` error, never a
-silently short list. Where the API has no server-side filter for a
+silently short list. The pagination envelope is validated per endpoint:
+every id-cursor list must carry `page` as an object whose `nextPage` is
+null (done) or a non-empty id; the treasury ledger's `cursor` must be null
+(done) or a non-negative integer. Anything else is a `malformed pagination
+metadata` error; "no more pages" is never concluded from a missing or
+malformed envelope. Rows repeated with identical content, inside a page or
+across pages, are dropped once and counted in `duplicates_dropped`, which
+every paginated result carries (`reportable_totals` reports it under
+`totals`, `list_tax_docs` per walk); the same id with different content is
+a `conflicting duplicate rows` error. Where the API has no server-side filter for a
 documented argument, the tool says so below and filters client-side;
 windowed feeds are walked in full (there is no early stop).
 
@@ -86,7 +100,7 @@ documents_enabled (bool)
 ### `list_accounts(entity)`
 
 ```text
-entity
+entity, duplicates_dropped
 accounts[]   id, name, nickname, legalBusinessName, kind, type, status, availableBalance,
              currentBalance, createdAt, canReceiveTransactions, dashboardLink, accountNumberLast4
 ```
@@ -99,7 +113,7 @@ Excluded: `accountNumber` (masked), `routingNumber`, `canSendRealTimePayments`.
 dashboard shows `postedAt`. `limit` 1–5000.
 
 ```text
-entity, filters {account_id, start, end, search, limit}, count, truncated
+entity, filters {account_id, start, end, search, limit}, count, truncated, duplicates_dropped
 transactions[]  id, accountId, amount, status, kind, createdAt, postedAt, estimatedDeliveryDate,
                 failedAt, reasonForFailure, counterpartyId, counterpartyName, counterpartyNickname,
                 bankDescription, externalMemo, note, mercuryCategory,
@@ -135,7 +149,8 @@ date_basis      {field: "postedAt", timezone: "UTC", fallback_to_createdAt_count
 status_basis    ["sent"]
 totals          reportable_total, reportable_payment_count, recipient_count, flagged_count,
                 needs_review_total, needs_review_count, reportable_total_upper_bound,
-                unclassified_count, transactions_scanned
+                unclassified_count, transactions_scanned, duplicates_dropped (transaction rows),
+                recipient_duplicates_dropped
 recipients[]    display_name, recipient_id | null, counterparty_id | null, grouping, confidence,
                 total, payment_count, by_method {label: {count, total}}, flagged,
                 possible_same_payee [ids], name_merged_total, flagged_for_review
@@ -145,13 +160,18 @@ needs_review    {linked_account_transfers: [...], unlabeled_debits: [...]}; each
                 possible_same_payee [other counterparty ids with the same normalised name],
                 name_merged_total, would_flag_merged (true only when same-name siblings exist and their merged total reaches the threshold; single rows rely on would_flag — check either)
 unclassified[]  id, kind, status, amount, postedAt, counterpartyName, reason
+                (each scalar-projected: a value that arrives as an object or array is null)
 excluded_summary {category: {count, amount}}
 ```
+
+`display_name` is the recipient's name from `GET /recipients` when it is a
+string, otherwise the most common counterparty name on the transactions;
+an object or array in either place is never copied into the result.
 
 ### `list_recipients(entity)`
 
 ```text
-entity, count
+entity, count, duplicates_dropped
 recipients[]  id, name, nickname, status, defaultPaymentMethod, dateLastPaid, emails, contactEmail, isBusiness
 ```
 
@@ -160,12 +180,14 @@ Excluded: every routing-info block, addresses, `checkInfo`, `attachments`, `invi
 ### `list_tax_docs(entity)`
 
 ```text
-entity, document_count, recipient_count, recipients_with_docs
+entity, document_count, recipient_count, recipients_with_docs, duplicates_dropped {attachments, recipients}
 documents[]                id, recipientId, recipientName | null, fileName, formType (w9 | w8BEN | w8BENE | unknown | null), uploadedAt
-recipients_without_docs[]  id, name, status
+recipients_without_docs[]  id, name | null, status | null
 ```
 
-Excluded: `url` (presigned).
+Excluded: `url` (presigned). `recipientName`, `name`, and `status` are
+joined from the projected recipient objects, so a value that arrives as an
+object or array is null here exactly as it is in `list_recipients`.
 
 ## Organization, statements, treasury, credit (Phase 3)
 
@@ -191,7 +213,7 @@ June 2026) suggests credit statements may be served; if they are, only
 the depository fields below surface.
 
 ```text
-entity, account_id, filters {start, end, limit}, count, truncated
+entity, account_id, filters {start, end, limit}, count, truncated, duplicates_dropped
 statements[]  id, startDate, endDate, endingBalance, companyLegalName, accountNumberLast4, einLast4, transactionCount
 ```
 
@@ -211,16 +233,21 @@ Returns two content blocks rather than a JSON object:
 The document is **verbatim and unredacted**: a statement carries the full
 account number, routing number, address, and every transaction. The body
 must arrive as `application/pdf` or `application/octet-stream` (checked
-before any byte is read), start with `%PDF-`, and carry a `%%EOF` marker
-in its last 2 KB; otherwise the tool returns a fixed error that never
-quotes the body or the content type. The PDF is capped at 10 MB of wire
-bytes (refused by declared length before download, and by a streaming cap
+before any byte is read) and pass an envelope check: it starts with
+`%PDF-` and a `%%EOF` marker occurs within the last 2 KiB after trailing
+PDF whitespace (NUL, TAB, LF, FF, CR, SPACE) is ignored. That is not PDF
+parsing (a linearized file, an incremental update with two markers, or a
+short trailer after a marker all pass; a truncated file or an HTML error
+page fails), and the bytes are returned exactly as received, padding
+included. Otherwise the tool returns a fixed error that never quotes the
+body or the content type. The PDF is capped at 10 MB of wire bytes
+(refused by declared length before download, and by a streaming cap
 during it) and is never written to disk.
 
 ### `list_treasury(entity)`
 
 ```text
-entity, count
+entity, count, duplicates_dropped
 treasury_accounts[]  id, status, availableBalance, currentBalance, createdAt,
                      netReturns [{month, netAmount, treasuryFee, status (processing | pending | charged | error),
                                   dividends [{id, type, securityName, amount}]}]
@@ -239,7 +266,7 @@ Without a window the API's own `desc` order is returned as is. The cost of
 a window is proportional to the ledger, not the window.
 
 ```text
-entity, treasury_id, filters {start, end, limit}, count, truncated
+entity, treasury_id, filters {start, end, limit}, count, truncated, duplicates_dropped
 transactions[]  id, accountId, type, amount, balance, canonicalDay, description, additionalDetails,
                 security, details {creditDescription, depositCounterpartyId, feeDescription,
                 manualAmendmentDescription, security, sweepDirection, tradeAction, withdrawalCounterpartyId}
@@ -252,7 +279,7 @@ is one of MonthlyStatement, TradeConfirmation, 1099, 1099R, 1042S, 5498,
 5498ESA, 1099Q, FMV, SDIRA.
 
 ```text
-entity, treasury_id, filters {document_type}, count
+entity, treasury_id, filters {document_type}, count, duplicates_dropped
 statements[]  id, accountId, documentType, description, periodStart, periodEnd, creationDate, createdAt, updatedAt
 ```
 
@@ -278,7 +305,7 @@ credit_accounts[]  id, status, availableBalance, currentBalance, createdAt
 1–1000.
 
 ```text
-entity, filters {account_id, status, limit}, count, truncated
+entity, filters {account_id, status, limit}, count, truncated, duplicates_dropped
 cards[]  id, accountId, userId, nameOnCard, nickname, lastFour, kind (debit | credit),
          type (virtual | physical), status, physicalCardStatus, isAgentCard, spendLimitType,
          spendLimit {amountCents, atmAmountCents, interval} | null, budgets [{id, name, amountCents, remainingAmountCents}],
@@ -297,7 +324,7 @@ card  (same fields as one `list_cards` row)
 ### `list_categories(entity)`
 
 ```text
-entity, count
+entity, count, duplicates_dropped
 categories[]  id, name, visibleForCardSpend, visibleForOther, visibleForReimbursements
 ```
 
@@ -307,7 +334,7 @@ Priority merchants usable for card merchant locks; `search` is a
 case-insensitive name filter applied by the API. `limit` 1–1000.
 
 ```text
-entity, filters {search, limit}, count, truncated
+entity, filters {search, limit}, count, truncated, duplicates_dropped
 merchants[]  id, name
 ```
 
@@ -316,7 +343,7 @@ merchants[]  id, name
 ### `list_customers(entity)`
 
 ```text
-entity, count
+entity, count, duplicates_dropped
 customers[]  id, name, email, deletedAt | null
 ```
 
@@ -331,7 +358,7 @@ any other value is an error listing these, without echoing the value);
 invoice first.
 
 ```text
-entity, filters {status, start, end, limit}, count, truncated
+entity, filters {status, start, end, limit}, count, truncated, duplicates_dropped
 invoices[]  id, invoiceNumber, status, amount, currencyCode, customerId, destinationAccountId,
             invoiceDate, dueDate, createdAt, updatedAt, canceledAt, poNumber, payerMemo, internalNote,
             ccEmails, achDebitEnabled, creditCardEnabled, useRealAccountNumber
@@ -355,8 +382,10 @@ and caps as `get_statement_pdf`, with `invoice_id` in the metadata and
 is verbatim and unredacted. Mercury's docs disagree on the path parameter
 (the reference page says the invoice uuid, the invoice schema says the
 public `slug`), so the id is tried first and, on a 404, the invoice's slug
-is used internally; neither the slug nor the id appears in output or
-errors (endpoint labels mask every id segment).
+is used internally. The invoice id you pass appears in the success
+metadata and in the resource URI (`mercury://<entity>/invoices/<id>.pdf`);
+the slug never appears anywhere, and ids in error text are masked to
+`{id}` by the endpoint label.
 
 ### `list_invoice_attachments(entity, invoice_id)`
 
@@ -372,7 +401,7 @@ Excluded: `url` (signed download link).
 ### `list_users(entity)`
 
 ```text
-entity, count
+entity, count, duplicates_dropped
 users[]  userId, firstName, lastName, email, organizationRole
          (administrator | bookkeeper | customUser | cardOnlyUser | employee)
 ```
@@ -393,7 +422,7 @@ matching event; the cost of `since` is the whole 90-day feed. Without
 `since` the API's own `desc` order is returned as is.
 
 ```text
-entity, filters {since, resource_type, limit}, count, truncated
+entity, filters {since, resource_type, limit}, count, truncated, duplicates_dropped
 events[]  id, resourceType, resourceId, operationType (create | update | delete), resourceVersion,
           occurredAt, changedPaths [...], mergePatch | null, previousValues | null, patchOmitted? (true)
 ```
@@ -414,7 +443,7 @@ set; `changedPaths` is still returned.
 Read-only view of the organization's webhook endpoints.
 
 ```text
-entity, count
+entity, count, duplicates_dropped
 webhooks[]  id, url_fingerprint (first 8 hex chars of sha256 of the receiver URL) | null,
             status (active | paused | disabled), enabled (status == active),
             eventTypes [...] | null, filterPaths [...] | null, createdAt, updatedAt

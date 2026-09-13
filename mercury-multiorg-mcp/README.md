@@ -22,9 +22,9 @@ What leaves this server falls into four classes, and the guarantees differ:
 | Class | What it is | Guarantee |
 | --- | --- | --- |
 | **Structured fields** | Every key of every object in a tool result | Allowlisted at every level: each object, and each nested object inside it, is projected through an explicit allowlist copied from the live schema. A key that is not listed does not leave the server, at any depth. Account numbers and tax ids appear only as their last four digits; routing numbers, counterparty bank details, postal addresses, card expiry, presigned download URLs, invoice pay-page slugs, webhook receiver URLs, and webhook signing secrets are never returned. |
-| **Tool errors** | The text of an `is_error` result | Fixed messages only: an HTTP status, an endpoint label with ids replaced by `{id}`, and a hint chosen from a table. Nothing from Mercury's response body or headers, and no argument you passed, is ever quoted (an invalid id is reported as "invalid id format"). Every message is additionally scrubbed for the entity's own token value before it is returned; that scrub does not depend on the logging filter. |
+| **Tool errors** | The text of an `is_error` result | Fixed messages only: an HTTP status, an endpoint label with ids replaced by `{id}`, and a hint chosen from a table. Nothing from Mercury's response body or headers, and no argument you passed, is ever quoted (an invalid id is reported as "invalid id format"). Every message is additionally scrubbed for the entity's own token value before it is returned; that scrub does not depend on the logging filter. Argument-validation failures (a wrong type, a missing required argument) are rendered by this server as the field path and the expected type only, for example `year: expected an integer (int_parsing)`; the MCP SDK's own rendering, which quotes the value you passed, never reaches the client. |
 | **Free-text fields** | Transaction memos, counterparty names, bank descriptions, invoice memos and notes, attachment file names, customer and user names | Returned verbatim. They are third-party text and can contain anything, including instructions aimed at the model and identifiers typed by a human. Treat every tool result as untrusted data, never as instructions. |
-| **Documents** | Statement and invoice PDFs from `get_statement_pdf` / `get_invoice_pdf` | **Verbatim and unredacted**, opt-in only. A statement PDF contains the full account number, routing number, address, and every transaction. The two tools exist only when the server is started with `--allow-documents` (or `MERCURY_ALLOW_DOCUMENTS=1`); `server_info.documents_enabled` reports the setting. The body must arrive as `application/pdf` (or `application/octet-stream`), start with `%PDF-`, and end with a `%%EOF` marker; anything else is a clean error. |
+| **Documents** | Statement and invoice PDFs from `get_statement_pdf` / `get_invoice_pdf` | **Verbatim and unredacted**, opt-in only. A statement PDF contains the full account number, routing number, address, and every transaction. The two tools exist only when the server is started with `--allow-documents` (or `MERCURY_ALLOW_DOCUMENTS=1`); `server_info.documents_enabled` reports the setting. The body must arrive as `application/pdf` (or `application/octet-stream`), start with `%PDF-`, and carry a `%%EOF` marker within the last 2 KiB once trailing PDF whitespace is ignored; anything else is a clean error. That is an envelope check, not PDF parsing: a document that passes it can still be malformed inside, and the bytes are returned exactly as received. |
 
 The rest of the model:
 
@@ -38,7 +38,11 @@ The rest of the model:
   (it must be named `MERCURY_TOKEN_…`, so a registry cannot point the server
   at some other secret); the server reads that env var and nothing else.
   Errors and logs never contain more than the last four characters of a
-  token. At startup the server warns, per entity, when a configured value
+  token. Literal known-token scrubbing applies to values of 8 or more
+  characters; a shorter configured value is not literal-scrubbed (the
+  `secret-token:` shape scrub and the `Authorization` header scrub still
+  apply, and no message quotes upstream or caller data in the first
+  place). At startup the server warns, per entity, when a configured value
   does not carry Mercury's documented `secret-token:` prefix.
 - **Only Mercury hosts.** `--api-base` / `MERCURY_API_BASE` must be
   `https://api.mercury.com`, `https://api-sandbox.mercury.com`, or a
@@ -53,9 +57,16 @@ The rest of the model:
   past the limit in memory. Error responses are never read at all.
 - **Complete or loud.** Every paginated walk either completes or fails. A
   page that repeats already-seen rows or does not advance the cursor while
-  the API still advertises more, or a walk that needs more than 200 pages,
-  is an error, never a partial list. `reportable_totals` in particular can
-  never return a total built on a stalled walk.
+  the API still advertises more, a walk that needs more than 200 pages, or
+  a response whose pagination metadata is missing or malformed (no `page`
+  object, a `nextPage` that is neither null nor an id, a treasury `cursor`
+  that is not a non-negative integer) is an error, never a partial list and
+  never "the last page". A row repeated with identical content, inside a
+  page or across pages, is dropped once and counted in `duplicates_dropped`
+  on every paginated result (and in `reportable_totals.totals`); the same
+  id with different content is an error. `reportable_totals` in particular
+  can never return a total built on a stalled, malformed, or double-counted
+  walk.
 - **Windowed feeds are walked in full.** Mercury documents no sort key for
   events or treasury transactions, so a client-side window (`since` on
   `list_events`, `start`/`end` on `list_treasury_transactions`) walks the
@@ -81,7 +92,7 @@ its first commit: no real names, tokens, account numbers, or financial
 identifiers appear in tracked files, fixtures, or commit messages, and
 gitleaks runs on the full history before every release. History note: the
 first Phase 1 commit's fixtures used a real, public ABA routing number as
-sample data; it was replaced with an obviously fake value two commits later
+sample data; it was replaced with an obviously fake value in the next commit
 and is not present at any tag. It identifies a bank, not an account, and
 the history was deliberately not rewritten.
 
@@ -143,12 +154,33 @@ Mercury deletes tokens unused for 45 days and downgrades unused permissions on
 the same clock. Run `mercury-multiorg-mcp-keepalive` on a schedule; see
 [docs/keepalive.md](docs/keepalive.md) for cron and launchd snippets.
 
-## Register in Claude Code
+## Works with any MCP client
 
-`.mcp.json` in this folder registers the server against the example registry
-(no tokens, so `list_accounts` returns a clean per-entity error). For real use,
-copy the block into your private project's `.mcp.json` and point `--entities`
-at your private registry:
+This is a standard MCP server over stdio. Any MCP client that can launch a
+command works; the command and arguments are the same everywhere:
+
+```text
+command: uvx
+args:    --from git+https://github.com/dkaleganov/personal-ai-systems@<FULL_COMMIT_SHA>#subdirectory=mercury-multiorg-mcp
+         mercury-multiorg-mcp --entities /private/path/entities.yaml
+optional extra arg: --allow-documents   (registers the two unredacted PDF tools)
+```
+
+Tokens reach the server as environment variables named in your registry.
+Two ways to supply them: an `env` block in the client's config (only where
+the client expands placeholders such as `${MERCURY_TOKEN_ACME_MAIN}` from
+your shell; a literal token in a config file is a secret on disk), or a
+private dotenv file passed with `--env-file /private/path/mercury.env`
+(works with every client; existing process env vars still win). Keep the
+registry and the dotenv file outside any repository and readable only by
+your user.
+
+### Claude Code (`.mcp.json`)
+
+Claude Code expands `${VAR}` from the launching shell. The `.mcp.json` in
+this folder is a Claude Code convention that registers the server against
+the example registry (no tokens, so `list_accounts` returns a clean
+per-entity error); it is harmless for other clients, which ignore it.
 
 ```json
 {
@@ -170,14 +202,10 @@ at your private registry:
 }
 ```
 
-Add `"--allow-documents"` to `args` only for a session that needs the PDF tools.
+### Claude Desktop (`claude_desktop_config.json`)
 
-### Claude Desktop
-
-Claude Desktop reads `claude_desktop_config.json` (Settings → Developer →
-Edit Config). It does **not** expand `${VAR}` placeholders, so put the
-token env vars in a private dotenv file and pass `--env-file` (existing
-process env vars still win):
+Settings → Developer → Edit Config. Claude Desktop does **not** expand
+`${VAR}` placeholders, so use `--env-file`:
 
 ```json
 {
@@ -198,13 +226,80 @@ process env vars still win):
 }
 ```
 
-Keep both files outside any repository and readable only by your user.
+### Codex CLI (`~/.codex/config.toml`)
+
+```toml
+[mcp_servers.mercury-multiorg]
+command = "uvx"
+args = [
+  "--from", "git+https://github.com/dkaleganov/personal-ai-systems@<FULL_COMMIT_SHA>#subdirectory=mercury-multiorg-mcp",
+  "mercury-multiorg-mcp",
+  "--entities", "/private/path/entities.yaml",
+  "--env-file", "/private/path/mercury.env",
+]
+# `env = { MERCURY_TOKEN_ACME_MAIN = "..." }` is also accepted, but values there are
+# literal, so prefer --env-file over putting a token in this file.
+```
+
+### Cursor, Windsurf, VS Code (`mcp.json`)
+
+Cursor (`.cursor/mcp.json` or the global one) and Windsurf
+(`mcp_config.json`) use an `mcpServers` map; VS Code (`.vscode/mcp.json`)
+uses a `servers` map with the same entry shape. Use `--env-file` unless
+your client's documentation says it expands environment placeholders.
+
+```json
+{
+  "mcpServers": {
+    "mercury-multiorg": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/dkaleganov/personal-ai-systems@<FULL_COMMIT_SHA>#subdirectory=mercury-multiorg-mcp",
+        "mercury-multiorg-mcp",
+        "--entities",
+        "/private/path/entities.yaml",
+        "--env-file",
+        "/private/path/mercury.env"
+      ]
+    }
+  }
+}
+```
+
+### Gemini CLI (`settings.json`)
+
+```json
+{
+  "mcpServers": {
+    "mercury-multiorg": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/dkaleganov/personal-ai-systems@<FULL_COMMIT_SHA>#subdirectory=mercury-multiorg-mcp",
+        "mercury-multiorg-mcp",
+        "--entities",
+        "/private/path/entities.yaml",
+        "--env-file",
+        "/private/path/mercury.env"
+      ]
+    }
+  }
+}
+```
+
+### Any other client
+
+Anything that speaks MCP over stdio and can launch a command: point it at
+the same `uvx` command and arguments. The server never opens a network
+listener, so an HTTP or SSE transport is not offered.
 
 ## Tools
 
 Every tool below takes `entity` first (except the two registry tools) and
-returns it in the result. Paginated lists take `limit` and return `count`
-and `truncated`. Full field-by-field reference: [docs/tools.md](docs/tools.md).
+returns it in the result. Paginated lists take `limit` and return `count`,
+`truncated`, and `duplicates_dropped` (identical rows the walk dropped).
+Full field-by-field reference: [docs/tools.md](docs/tools.md).
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
@@ -291,9 +386,12 @@ tomorrow at any depth is dropped, not passed through.
 
 Lists keep the API's default order (ascending by an undocumented sort key)
 except transactions, statements, treasury transactions, and events, which
-are newest first; when `truncated` is true, the rows kept are the head of
-that order (for a windowed events or treasury query, the head of the
-locally sorted, newest-first result).
+are requested in API `desc` order. Mercury documents no sort key, so
+chronological (newest-first) order is guaranteed only for windowed calls
+(`since` on events, `start`/`end` on treasury transactions), which sort
+locally on `occurredAt` / `canonicalDay` before `limit` applies; an
+unwindowed call returns the API's `desc` order as is. When `truncated` is
+true, the rows kept are the head of whichever order applies.
 
 Where the Mercury API has no server-side filter for a documented argument
 (`since` on events, `start`/`end` on treasury transactions and invoices,
