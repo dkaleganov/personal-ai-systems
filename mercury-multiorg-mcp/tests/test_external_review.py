@@ -803,4 +803,6 @@ def test_hardening_readme_and_docs_carry_the_new_contract():
     for needle in ("url_fingerprint", "--allow-documents", "walked in full", "every level"):
         assert needle in tools, needle
     assert "order_verified" not in tools and "order_verified" not in readme and "path_fingerprint" not in readme
-    assert "0.1.1" in changelog and "0.1.1" in readme
+    from mercury_multiorg_mcp import __version__
+
+    assert "0.1.1" in changelog and __version__ in readme and __version__ in changelog

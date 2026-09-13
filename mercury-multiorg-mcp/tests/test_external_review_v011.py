@@ -548,7 +548,8 @@ def test_docs_corrections_and_client_neutral_wording():
     assert "Works with any MCP client" in readme
     for client_name in ("Codex", "Cursor", "Windsurf", "VS Code", "Gemini CLI", "Claude Desktop", "Claude Code"):
         assert client_name in readme, client_name
-    assert "[mcp_servers.mercury-multiorg]" in readme and "Claude Code convention" in readme
+    assert "[mcp_servers.mercury-multiorg]" in readme
+    assert "clients that discover this format may offer to launch it" in readme  # v0.1.2 wording for the example .mcp.json
     assert "duplicates_dropped" in readme and "duplicates_dropped" in tools and "malformed pagination metadata" in tools
     assert "API `desc` order" in readme and "guaranteed only for windowed" in readme
     assert "last 2 KiB" in readme and "not PDF parsing" in readme

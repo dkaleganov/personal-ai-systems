@@ -5,8 +5,10 @@
 An MCP server exposing read-only tools across multiple Mercury organizations
 at once. Mercury's official hosted MCP and its API token model are
 effectively single-organization per connection. This server holds one
-read-only API token per org and routes every tool call by an explicit
-entity key, so one AI session can see a whole multi-entity setup.
+read-only API token per org. Every tool that accesses Mercury requires an
+explicit entity key and identifies it in its successful result
+(`list_entities` and `server_info` take no entity argument), so one AI
+session can see a whole multi-entity setup.
 
 This package lives in a public monorepo. It is public from its first
 commit. No personal names, real company names, EINs, account numbers,
@@ -29,8 +31,10 @@ when public (e.g. no real ABA routing numbers; use obviously fake values).
    wait for confirmation that it is set.
 3. Read-only only. No state-changing endpoint gets a client method, even
    as a stub.
-4. Every tool takes an explicit `entity` parameter. No default entity
-   anywhere. Every tool result carries the entity key it came from.
+4. Call `list_entities` to discover entity keys. Every tool that accesses
+   Mercury requires an explicit `entity` and identifies it in its
+   successful result. `list_entities` and `server_info` require no entity
+   argument. No default entity anywhere.
 5. Live docs beat this brief. Before writing or changing the API client,
    fetch the docs listed under API notes; note any discrepancy in a code
    comment.
@@ -39,7 +43,7 @@ when public (e.g. no real ABA routing numbers; use obviously fake values).
    plus the `mercury-api-token` rule for `secret-token:mercury_production_…`
    / `…_sandbox_…`): `gitleaks git --no-banner --redact .`
 
-## Tool surface (all read-only, `entity` required, no defaults)
+## Tool surface (all read-only; Mercury API tools require entity, with no default)
 
 Phase 1 — core:
 - `list_entities`: keys and display names from the registry, plus
@@ -88,8 +92,8 @@ Phase 2 — 1099 support (built 2026-09-12):
 
 Classification table for `reportable_totals` (decided Phase 2 against the
 live `TransactionKind` enum, revised after real-organization acceptance
-2026-09-12; mirrored in `classify.py`, the tool docstring, and README.md,
-keep all four in sync). The live docs define no semantics for kind values, so
+2026-09-12; mirrored in `classify.py`, README.md, and docs/tools.md, which
+the tool docstring points to; keep all four in sync). The live docs define no semantics for kind values, so
 the table only asserts what the kind name itself supports. Real data
 showed negative `externalTransfer` rows were the organization's own linked
 external bank accounts and cross-organization Mercury transfers (not
@@ -434,6 +438,16 @@ not use the third-party standalone `fastmcp` package — official SDK only.
    check ignores trailing PDF whitespace and is documented as an envelope
    check. Tests in `tests/test_external_review_v011.py`. AGENTS.md at the
    package root points agents that read that file here.
+6. v0.1.2 (built 2026-09-13): documentation accuracy and schema metadata
+   from the third external review (published-tag validation of
+   mercury-v0.1.1; no runtime changes). Reviewer wording applied
+   verbatim where given; JSON-Schema `enum` metadata on
+   `list_cards.status`, `list_invoices.status`,
+   `list_treasury_statements.document_type`, `list_events.resource_type`
+   and `format: date` on the YYYY-MM-DD-only arguments, via
+   `json_schema_extra` so server acceptance is unchanged (the tool
+   docstring's classification table now lives in docs/tools.md and
+   README.md). Tests in `tests/test_external_review_v012.py`.
 
 ## Definition of done for public
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mercury-multiorg-mcp"
-version = "0.1.1"
+version = "0.1.2"
 description = "Read-only MCP server exposing multiple Mercury organizations to one AI session, routed by explicit entity key."
 readme = "README.md"
 license = "MIT"

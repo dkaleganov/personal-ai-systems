@@ -1,15 +1,22 @@
 # Keepalive
 
-Mercury automatically **deletes any API token that goes unused for 45
-days** and **downgrades permissions unused for 45 days** (an email notice
-goes to org admins seven days before either). Source:
+Mercury runs two 45-day clocks per API token. The **token inactivity
+clock** deletes a token that has not been used for 45 days; separately,
+**unused-permission expiry** downgrades permissions that have not been
+exercised for 45 days (an email notice goes to org admins seven days
+before either). Source:
 [API token security policies](https://docs.mercury.com/docs/api-token-security-policies).
-Any authenticated call resets the clock, so a read-only server that is
-only used occasionally can lose its tokens without anyone noticing.
+An authenticated request resets the token inactivity clock, so a read-only
+server that is only used occasionally can lose its tokens without anyone
+noticing. This CLI addresses the inactivity clock; it does not exercise
+every permission, so unused-permission expiry is a separate concern.
 
-`mercury-multiorg-mcp-keepalive` makes one authenticated `GET /accounts`
-per configured organization and prints one line per entity. It is a CLI
-for cron or launchd, not an MCP tool, and it never prints a token.
+`mercury-multiorg-mcp-keepalive` makes one logical ping (an authenticated
+`GET /accounts?limit=1`, with bounded retries on 429/502/503/504 and
+transport errors; the body is closed unread) per token-bearing entity and
+prints one line per entity; if no entity has a token, it prints one
+aggregate failure line. It is a CLI for cron or launchd, not an MCP tool,
+and it never prints a token.
 
 ```bash
 # from a clone
@@ -33,7 +40,9 @@ prefix produces a warning line on stderr (last four characters only).
 
 ## Output
 
-One line per entity, in registry order, to stdout:
+One line per entity, in registry order, to stdout (one logical ping per
+token-bearing entity, with bounded retries; if no tokens exist, one
+aggregate failure line):
 
 ```
 2026-09-12T17:00:00Z OK acme_main HTTP 200

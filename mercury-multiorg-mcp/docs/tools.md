@@ -1,8 +1,10 @@
 # Tool reference
 
-Every tool is read-only. Every tool that touches Mercury takes an explicit
-`entity` (a key from `list_entities`) and returns it in the result. There
-is no default entity. Tool output is an allowlist projection of the live
+Every tool is read-only. Call `list_entities` to discover entity keys.
+Every tool that accesses Mercury requires an explicit `entity` and
+identifies it in its successful result. `list_entities` and `server_info`
+require no entity argument. There is no default entity. Tool output is an
+allowlist projection of the live
 Mercury schema; the allowlists in `src/mercury_multiorg_mcp/projections.py`
 enumerate every excluded field with a reason.
 
@@ -58,11 +60,17 @@ its body is read; a PDF is capped at 10 MB and a JSON body at 32 MB, both
 enforced on the bytes received while streaming (declared `Content-Length`
 above the cap fails before any byte is read).
 
-Lists that paginate take `limit` and return `count` plus `truncated`
-(true when more rows matched than `limit`). Lists keep the API's default
-order, which is ascending by an undocumented sort key, except transactions,
-statements, treasury transactions, and events, which are requested newest
-first; when `truncated` is true the rows kept are the head of that order.
+The seven tools with a `limit` argument (`list_transactions`,
+`list_statements`, `list_treasury_transactions`, `list_cards`,
+`list_merchants`, `list_invoices`, `list_events`) return `count` and
+`truncated` (true when more rows matched than `limit`). Full-list tools
+have no public limit. Paginated results also expose duplicate diagnostics
+(`duplicates_dropped`). Lists keep the API's default order, which is
+ascending by an undocumented sort key, except transactions, statements,
+treasury transactions, and events, which are requested in Mercury API
+`desc` order (no sort key is documented); only windowed calls sort
+locally, by `canonicalDay` for treasury and `occurredAt` for events. When
+`truncated` is true the rows kept are the head of that order.
 Every walk is bounded at 200 pages of 1000; exhausting it with more pages
 remaining is an error. A page that contributes no fresh rows, yields no
 usable cursor, or does not advance the cursor while the API still
@@ -110,7 +118,8 @@ Excluded: `accountNumber` (masked), `routingNumber`, `canSendRealTimePayments`.
 ### `list_transactions(entity, account_id?, start?, end?, search?, limit=100)`
 
 `start` / `end` filter on `createdAt` (YYYY-MM-DD or ISO 8601). The
-dashboard shows `postedAt`. `limit` 1–5000.
+dashboard shows `postedAt`. `limit` 1–5000. Rows come in Mercury API
+`desc` order (no sort key is documented).
 
 ```text
 entity, filters {account_id, start, end, search, limit}, count, truncated, duplicates_dropped
@@ -135,13 +144,31 @@ Excluded: `details` (counterparty bank coordinates), `attachments`,
 ### `reportable_totals(entity, year, threshold?)`
 
 Per-recipient totals of payments the organization made in a calendar year
-(by `postedAt`, UTC), classified by transaction `kind`; see the
-classification table in `CLAUDE.md`. `year` 2000–2100. `threshold` must
-be a finite number from 0 to 1,000,000,000 (an unrepresentable value is an
-error, never silently zero) and defaults to 600 through tax year 2025 and
-2000 from 2026. Every page of the year is walked; a walk that cannot
-complete is an error, never a partial total. This is a pre-filing
-cross-check; it never files anything.
+(by `postedAt`, UTC), classified by transaction `kind` per the table
+below. `year` 2000–2100. `threshold` must be a finite number from 0 to
+1,000,000,000 (an unrepresentable value is an error, never silently zero)
+and defaults to 600 through tax year 2025 and 2000 from 2026
+(inflation-indexed from 2027). The default is for nonemployee services and
+certain MISC payments; supply the applicable category/year threshold.
+Every page of the year is walked; a walk that cannot complete is an error,
+never a partial total. This is a pre-filing cross-check; it never files
+anything.
+
+| Decision | Kinds | Notes |
+| --- | --- | --- |
+| include | `outgoingPayment` | method from the payment details: `ach`, `domesticWire`, `internationalWire`, `check`, or `unknown` |
+| include | `exogenousWireDrawdown` (negative amount) | wire drawdown, presumed counterparty-initiated; undocumented (`wireDrawdown`) |
+| needs review | `externalTransfer` (negative amount) | `linked_account_transfers`: usually your own linked/external accounts or cross-org transfers; a vendor-initiated ACH debit could also appear |
+| needs review | `other` (negative amount) | `unlabeled_debits`: no method signal; typically vendor-initiated ACH debits or Mercury product payments |
+| exclude | `internalTransfer`, `treasuryTransfer` | the org's own accounts |
+| exclude | `creditCardTransaction`, `debitCardTransaction`, `creditCardCredit`, `debitCardCredit` | the card processor files 1099-K |
+| exclude | `wireFee`, `personalBankingSubscriptionFee`, `billingEngineSubscriptionFee`, `cardInternationalTransactionFee*` | bank fees and rebates |
+| exclude | `incomingDomesticWire`, `incomingInternationalWire`, `checkDeposit`, `interestPayment` | money received |
+| exclude | `currencyCloudReturn` | an international wire returned; the original may already be counted, net it by hand |
+| exclude | `expenseReimbursement` | employee reimbursements |
+| exclude | any includable, needs-review, or unclassified kind not `sent`, or with a non-negative amount | `not_settled:<status>` / `incoming` |
+| exclude | `postedAt` outside the requested year | `outside_year` (normally the one-day padding rows) |
+| unclassified | any kind not in the table, or a missing amount | listed one by one with a reason |
 
 ```text
 entity, year, threshold
@@ -203,7 +230,8 @@ Excluded: `ein` (masked to `einLast4`).
 
 ### `list_statements(entity, account_id, start?, end?, limit=100)`
 
-Monthly statements for one checking or savings account, newest first.
+Monthly statements for one checking or savings account, in Mercury API
+`desc` order.
 `start` / `end` (YYYY-MM-DD, real calendar dates) filter on the
 statement's period start date and may be at most three months apart
 (Mercury's rule, checked before any request). `limit` 1–1000. Treasury
@@ -235,11 +263,13 @@ account number, routing number, address, and every transaction. The body
 must arrive as `application/pdf` or `application/octet-stream` (checked
 before any byte is read) and pass an envelope check: it starts with
 `%PDF-` and a `%%EOF` marker occurs within the last 2 KiB after trailing
-PDF whitespace (NUL, TAB, LF, FF, CR, SPACE) is ignored. That is not PDF
-parsing (a linearized file, an incremental update with two markers, or a
-short trailer after a marker all pass; a truncated file or an HTML error
-page fails), and the bytes are returned exactly as received, padding
-included. Otherwise the tool returns a fixed error that never quotes the
+PDF whitespace (NUL, TAB, LF, FF, CR, SPACE) is ignored. The MIME/header/EOF
+checks validate the envelope only; a passing document may still be
+malformed or incomplete internally (a linearized file, an incremental
+update with two markers, a short trailer after a marker, and a truncated
+incremental append that still carries an earlier marker all pass; an empty
+body or an HTML error page fails). The bytes are returned exactly as
+received, padding included. Otherwise the tool returns a fixed error that never quotes the
 body or the content type. The PDF is capped at 10 MB of wire bytes
 (refused by declared length before download, and by a streaming cap
 during it) and is never written to disk.
@@ -257,7 +287,7 @@ treasury_accounts[]  id, status, availableBalance, currentBalance, createdAt,
 
 `limit` 1–5000.
 
-Ledger rows for one treasury account, newest first. The API has no date
+Ledger rows for one treasury account in Mercury API `desc` order. The API has no date
 filter on this endpoint and documents no sort key for `order`, so with
 `start` / `end` (YYYY-MM-DD, inclusive, on `canonicalDay`) the whole
 ledger is walked (up to 200 pages of 1000), filtered here, and sorted by
@@ -408,7 +438,7 @@ users[]  userId, firstName, lastName, email, organizationRole
 
 ### `list_events(entity, since?, resource_type?, limit=100)`
 
-The change-event feed, newest first. Mercury keeps events for 90 days.
+The change-event feed in Mercury API `desc` order. Mercury keeps events for 90 days.
 `resource_type` is one of transaction, checkingAccount, savingsAccount,
 treasuryAccount, investmentAccount, creditAccount (any other value is a
 400 from Mercury, surfaced as an error). `limit` 1–5000. The API has no

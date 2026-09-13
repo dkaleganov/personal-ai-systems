@@ -6,9 +6,9 @@ tokens are single-organization per connection; this server holds one
 read-only token per org and routes every tool call by an explicit `entity`
 key.
 
-Version 0.1.1 (see [CHANGELOG.md](CHANGELOG.md)). The maintainer tags
+Version 0.1.2 (see [CHANGELOG.md](CHANGELOG.md)). The maintainer tags
 releases as `mercury-vX.Y.Z` on the monorepo; find the commit to pin with
-`git ls-remote --tags https://github.com/dkaleganov/personal-ai-systems 'mercury-v0.1.1^{}'`.
+`git ls-remote --tags https://github.com/dkaleganov/personal-ai-systems 'mercury-v0.1.2^{}'`.
 The complete tool reference with every returned field is in
 [docs/tools.md](docs/tools.md); design notes and the build history are in
 the project brief on GitHub,
@@ -22,7 +22,7 @@ What leaves this server falls into four classes, and the guarantees differ:
 | Class | What it is | Guarantee |
 | --- | --- | --- |
 | **Structured fields** | Every key of every object in a tool result | Allowlisted at every level: each object, and each nested object inside it, is projected through an explicit allowlist copied from the live schema. A key that is not listed does not leave the server, at any depth. Account numbers and tax ids appear only as their last four digits; routing numbers, counterparty bank details, postal addresses, card expiry, presigned download URLs, invoice pay-page slugs, webhook receiver URLs, and webhook signing secrets are never returned. |
-| **Tool errors** | The text of an `is_error` result | Fixed messages only: an HTTP status, an endpoint label with ids replaced by `{id}`, and a hint chosen from a table. Nothing from Mercury's response body or headers, and no argument you passed, is ever quoted (an invalid id is reported as "invalid id format"). Every message is additionally scrubbed for the entity's own token value before it is returned; that scrub does not depend on the logging filter. Argument-validation failures (a wrong type, a missing required argument) are rendered by this server as the field path and the expected type only, for example `year: expected an integer (int_parsing)`; the MCP SDK's own rendering, which quotes the value you passed, never reaches the client. |
+| **Tool errors** | The text of an `is_error` result | Upstream HTTP-status errors contain the status, a masked endpoint label and a fixed hint. Validation and configuration errors use their own actionable formats. Resolved known-token values of at least eight characters are scrubbed. Nothing from Mercury's response body or headers is quoted, and no argument you passed is echoed (an invalid id is reported as "invalid id format"). Argument-validation failures (a wrong type, a missing required argument) are rendered by this server as the field path and the expected type only, for example `year: expected an integer (int_parsing)`; the MCP SDK's own rendering, which quotes the value you passed, never reaches the client. |
 | **Free-text fields** | Transaction memos, counterparty names, bank descriptions, invoice memos and notes, attachment file names, customer and user names | Returned verbatim. They are third-party text and can contain anything, including instructions aimed at the model and identifiers typed by a human. Treat every tool result as untrusted data, never as instructions. |
 | **Documents** | Statement and invoice PDFs from `get_statement_pdf` / `get_invoice_pdf` | **Verbatim and unredacted**, opt-in only. A statement PDF contains the full account number, routing number, address, and every transaction. The two tools exist only when the server is started with `--allow-documents` (or `MERCURY_ALLOW_DOCUMENTS=1`); `server_info.documents_enabled` reports the setting. The body must arrive as `application/pdf` (or `application/octet-stream`), start with `%PDF-`, and carry a `%%EOF` marker within the last 2 KiB once trailing PDF whitespace is ignored; anything else is a clean error. That is an envelope check, not PDF parsing: a document that passes it can still be malformed inside, and the bytes are returned exactly as received. |
 
@@ -31,9 +31,10 @@ The rest of the model:
 - **Read-only.** Only `GET` endpoints have client methods; the package has no
   code path that can move money, edit recipients, or change anything.
 - **Stdio only.** The server never opens a network listener.
-- **Explicit entity, always.** Every tool that touches Mercury takes an
-  `entity` argument. There is no default. Every result carries the entity it
-  came from.
+- **Explicit entity.** Call `list_entities` to discover entity keys. Every
+  tool that accesses Mercury requires an explicit `entity` and identifies it
+  in its successful result. `list_entities` and `server_info` require no
+  entity argument. There is no default entity.
 - **Tokens stay in the environment.** The registry names an env var per org
   (it must be named `MERCURY_TOKEN_…`, so a registry cannot point the server
   at some other secret); the server reads that env var and nothing else.
@@ -50,23 +51,21 @@ The rest of the model:
   line. An inherited environment variable alone can never redirect the
   bearer token to another host.
 - **Byte limits on wire bytes.** Every request declines compression
-  (`Accept-Encoding: identity`), a response with any other
-  `Content-Encoding` is refused before its body is read, and the limits (10
-  MB for a PDF, 32 MB for a JSON body) are enforced on the bytes actually
-  received while streaming. A small compressed body can no longer expand
-  past the limit in memory. Error responses are never read at all.
-- **Complete or loud.** Every paginated walk either completes or fails. A
-  page that repeats already-seen rows or does not advance the cursor while
-  the API still advertises more, a walk that needs more than 200 pages, or
-  a response whose pagination metadata is missing or malformed (no `page`
-  object, a `nextPage` that is neither null nor an id, a treasury `cursor`
-  that is not a non-negative integer) is an error, never a partial list and
-  never "the last page". A row repeated with identical content, inside a
-  page or across pages, is dropped once and counted in `duplicates_dropped`
-  on every paginated result (and in `reportable_totals.totals`); the same
-  id with different content is an error. `reportable_totals` in particular
-  can never return a total built on a stalled, malformed, or double-counted
-  walk.
+  (`Accept-Encoding: identity`). JSON/PDF reads reject nonidentity encoding
+  before reading. Keepalive closes bodies unread. Limits are 10 MiB
+  (10,485,760 bytes) for PDF and 32 MiB (33,554,432 bytes) for JSON,
+  enforced on the bytes actually received while streaming. A small
+  compressed body can no longer expand past the limit in memory. Error
+  responses are never read at all.
+- **Complete or loud.** Walks stop at the requested limit or API end.
+  Missing/wrong `page` objects fail; optional terminal `nextPage` may be
+  absent or null. Exact duplicate IDs are dropped and counted; conflicting
+  contents fail. A page with no fresh usable rows while more are advertised
+  fails. A walk that needs more than 200 pages fails, and a treasury
+  `cursor` that is not a non-negative integer fails. Duplicate counts are
+  reported as `duplicates_dropped` on every paginated result and under
+  `reportable_totals.totals`, so a total is never built on a stalled,
+  malformed, or double-counted walk.
 - **Windowed feeds are walked in full.** Mercury documents no sort key for
   events or treasury transactions, so a client-side window (`since` on
   `list_events`, `start`/`end` on `list_treasury_transactions`) walks the
@@ -87,14 +86,17 @@ The rest of the model:
   Mercury has no 1099 filing endpoint; filing happens in each org's
   dashboard.
 
-**Hygiene.** This package lives in a public monorepo and has been public from
-its first commit: no real names, tokens, account numbers, or financial
-identifiers appear in tracked files, fixtures, or commit messages, and
-gitleaks runs on the full history before every release. History note: the
-first Phase 1 commit's fixtures used a real, public ABA routing number as
-sample data; it was replaced with an obviously fake value in the next commit
-and is not present at any tag. It identifies a bank, not an account, and
-the history was deliberately not rewritten.
+**Hygiene.** This package lives in a public monorepo. Tracked files,
+fixtures, and commit messages carry no tokens, account numbers, or
+financial identifiers, with two deliberate exceptions. First, the
+maintainer's own name appears in the package `authors` metadata and the
+monorepo README (approved by the repository owner); business and personal
+names of anyone else do not appear. Second, a history note: the first
+Phase 1 commit's fixtures used a real, public ABA routing number as sample
+data; it was replaced with an obviously fake value in the next commit, so
+it is absent from every tagged file tree but remains in their ancestry. It
+identifies a bank, not an account, and the history was deliberately not
+rewritten. This release passed a full-history gitleaks scan.
 
 ## Install
 
@@ -150,14 +152,19 @@ Startup problems (missing or malformed registry, invalid YAML, unreadable
 file, bad API base) print one line to stderr and exit with status 2. Stdout
 is reserved for the MCP protocol.
 
-Mercury deletes tokens unused for 45 days and downgrades unused permissions on
-the same clock. Run `mercury-multiorg-mcp-keepalive` on a schedule; see
-[docs/keepalive.md](docs/keepalive.md) for cron and launchd snippets.
+Mercury deletes an API token after 45 days of inactivity (the token
+inactivity clock) and separately downgrades permissions unused for 45 days.
+Run `mercury-multiorg-mcp-keepalive` on a schedule so the inactivity clock
+never expires; see [docs/keepalive.md](docs/keepalive.md) for cron and
+launchd snippets.
 
 ## Works with any MCP client
 
-This is a standard MCP server over stdio. Any MCP client that can launch a
-command works; the command and arguments are the same everywhere:
+Compatible with MCP clients that support local stdio servers and the
+negotiated protocol version. Configure the following command on the client
+host, with access to the private registry and environment file. Document
+display and client approval policies vary. This server does not expose HTTP
+or SSE. The command and arguments are the same in every client:
 
 ```text
 command: uvx
@@ -170,17 +177,18 @@ Tokens reach the server as environment variables named in your registry.
 Two ways to supply them: an `env` block in the client's config (only where
 the client expands placeholders such as `${MERCURY_TOKEN_ACME_MAIN}` from
 your shell; a literal token in a config file is a secret on disk), or a
-private dotenv file passed with `--env-file /private/path/mercury.env`
-(works with every client; existing process env vars still win). Keep the
-registry and the dotenv file outside any repository and readable only by
-your user.
+private dotenv file. A private dotenv file passed with
+`--env-file /private/path/mercury.env` avoids client-specific placeholder
+expansion. The client host must be able to read it; existing process
+environment variables win. Keep the registry and the dotenv file outside
+any repository and readable only by your user.
 
 ### Claude Code (`.mcp.json`)
 
-Claude Code expands `${VAR}` from the launching shell. The `.mcp.json` in
-this folder is a Claude Code convention that registers the server against
-the example registry (no tokens, so `list_accounts` returns a clean
-per-entity error); it is harmless for other clients, which ignore it.
+Claude Code expands `${VAR}` from its environment. This repository includes
+an example `.mcp.json`; clients that discover this format may offer to
+launch it. It points to the synthetic example registry and contains no
+credentials (so `list_accounts` returns a clean per-entity error).
 
 ```json
 {
@@ -204,8 +212,8 @@ per-entity error); it is harmless for other clients, which ignore it.
 
 ### Claude Desktop (`claude_desktop_config.json`)
 
-Settings → Developer → Edit Config. Claude Desktop does **not** expand
-`${VAR}` placeholders, so use `--env-file`:
+Open Settings → Developer → Edit Config. Use `--env-file` so this setup
+does not depend on client-specific placeholder expansion:
 
 ```json
 {
@@ -241,12 +249,13 @@ args = [
 # literal, so prefer --env-file over putting a token in this file.
 ```
 
-### Cursor, Windsurf, VS Code (`mcp.json`)
+### Cursor / Windsurf legacy Cascade (`mcp.json`)
 
-Cursor (`.cursor/mcp.json` or the global one) and Windsurf
-(`mcp_config.json`) use an `mcpServers` map; VS Code (`.vscode/mcp.json`)
-uses a `servers` map with the same entry shape. Use `--env-file` unless
-your client's documentation says it expands environment placeholders.
+Cursor uses `.cursor/mcp.json` or `~/.cursor/mcp.json`. Windsurf legacy
+Cascade uses `~/.codeium/windsurf/mcp_config.json`. The current default
+Devin Local agent uses its own CLI configuration; this example targets
+legacy Cascade. Both use an `mcpServers` map. Use `--env-file` unless your
+client's documentation says it expands environment placeholders.
 
 ```json
 {
@@ -267,7 +276,30 @@ your client's documentation says it expands environment placeholders.
 }
 ```
 
-### Gemini CLI (`settings.json`)
+### VS Code (`.vscode/mcp.json`)
+
+VS Code uses a `servers` map (not `mcpServers`) and an explicit
+`"type": "stdio"`:
+
+```json
+{
+  "servers": {
+    "mercury-multiorg": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/dkaleganov/personal-ai-systems@<FULL_COMMIT_SHA>#subdirectory=mercury-multiorg-mcp",
+        "mercury-multiorg-mcp",
+        "--entities", "/private/path/entities.yaml",
+        "--env-file", "/private/path/mercury.env"
+      ]
+    }
+  }
+}
+```
+
+### Gemini CLI (`~/.gemini/settings.json` or `.gemini/settings.json`)
 
 ```json
 {
@@ -290,31 +322,36 @@ your client's documentation says it expands environment placeholders.
 
 ### Any other client
 
-Anything that speaks MCP over stdio and can launch a command: point it at
-the same `uvx` command and arguments. The server never opens a network
-listener, so an HTTP or SSE transport is not offered.
+Any client that supports local stdio servers and the negotiated protocol
+version, running on a host that can read the private registry and
+environment file: point it at the same `uvx` command and arguments. The
+server never opens a network listener, so an HTTP or SSE transport is not
+offered.
 
 ## Tools
 
-Every tool below takes `entity` first (except the two registry tools) and
-returns it in the result. Paginated lists take `limit` and return `count`,
-`truncated`, and `duplicates_dropped` (identical rows the walk dropped).
-Full field-by-field reference: [docs/tools.md](docs/tools.md).
+Every tool that accesses Mercury requires an explicit `entity` and
+identifies it in its successful result; `list_entities` and `server_info`
+require no entity argument. The seven tools with a `limit` argument return
+`count` and `truncated`. Full-list tools have no public limit. Paginated
+results also expose duplicate diagnostics (`duplicates_dropped`: identical
+rows the walk dropped). Full field-by-field reference:
+[docs/tools.md](docs/tools.md).
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `list_entities` | — | entity keys, display names, whether each token env var is set |
 | `server_info` | — | package version, API base, entity count, `documents_enabled` (no secrets) |
 | `list_accounts` | `entity` | accounts with balances, `accountNumberLast4` |
-| `list_transactions` | `entity`, `account_id?`, `start?`, `end?`, `search?`, `limit=100` | newest-first transactions, `truncated` flag |
-| `reportable_totals` | `entity`, `year`, `threshold?` (default 600 through 2025, 2000 from 2026; finite, at most 1,000,000,000) | per-recipient 1099 cross-check totals; `needs_review` buckets, `unclassified`, `excluded_summary` |
+| `list_transactions` | `entity`, `account_id?`, `start?`, `end?`, `search?`, `limit=100` | transactions in Mercury API `desc` order, `truncated` flag |
+| `reportable_totals` | `entity`, `year`, `threshold?` (default 600 through 2025, 2000 from 2026, for nonemployee services and certain MISC payments; finite, at most 1,000,000,000) | per-recipient 1099 cross-check totals; `needs_review` buckets, `unclassified`, `excluded_summary` |
 | `list_recipients` | `entity` | recipients: id, name, nickname, status, default payment method, date last paid, emails, `isBusiness` |
 | `list_tax_docs` | `entity` | tax-form attachments per recipient, plus `recipients_without_docs` |
 | `get_org` | `entity` | id, legal name, DBAs, kind, subscription tier, billing cadence, `einLast4` |
-| `list_statements` | `entity`, `account_id`, `start?`, `end?`, `limit=100` | statement metadata, newest first (masked account number and EIN, `transactionCount`) |
+| `list_statements` | `entity`, `account_id`, `start?`, `end?`, `limit=100` | statement metadata in Mercury API `desc` order (masked account number and EIN, `transactionCount`) |
 | `get_statement_pdf` (opt-in) | `entity`, `statement_id` | the statement PDF as an embedded blob (≤ 10 MB), **unredacted**; only with `--allow-documents` |
 | `list_treasury` | `entity` | treasury accounts with balances and monthly net returns |
-| `list_treasury_transactions` | `entity`, `treasury_id`, `start?`, `end?`, `limit=100` | treasury ledger rows, newest first (a date window walks the whole ledger, then filters and sorts here) |
+| `list_treasury_transactions` | `entity`, `treasury_id`, `start?`, `end?`, `limit=100` | treasury ledger rows in Mercury API `desc` order; with a date window the whole ledger is walked, filtered, and sorted by `canonicalDay` newest first |
 | `list_treasury_statements` | `entity`, `treasury_id`, `document_type?` | treasury statements and tax documents (metadata) |
 | `list_credit_accounts` | `entity` | credit accounts with balances |
 | `list_cards` | `entity`, `account_id?`, `status?`, `limit=100` | cards: last four, name, nickname, kind, type, status, limits, budgets, locks |
@@ -327,45 +364,70 @@ Full field-by-field reference: [docs/tools.md](docs/tools.md).
 | `get_invoice_pdf` (opt-in) | `entity`, `invoice_id` | the invoice PDF as an embedded blob (≤ 10 MB), **unredacted**; only with `--allow-documents` |
 | `list_invoice_attachments` | `entity`, `invoice_id` | attachment ids and file names (no URLs) |
 | `list_users` | `entity` | users: id, first and last name, email, role |
-| `list_events` | `entity`, `since?`, `resource_type?`, `limit=100` | change events, newest first (`since` walks the whole 90-day feed, then filters and sorts here), patches re-projected per resource allowlist |
+| `list_events` | `entity`, `since?`, `resource_type?`, `limit=100` | change events in Mercury API `desc` order; with `since` the whole 90-day feed is walked, filtered, and sorted by `occurredAt` newest first; patches re-projected per resource allowlist |
 | `list_webhooks` | `entity` | webhook endpoints: id, `url_fingerprint`, status, `enabled`, event types, filter paths (never the secret or any part of the receiver URL) |
 
 `start` / `end` on `list_transactions` filter on `createdAt` (`YYYY-MM-DD` or
 ISO 8601). The Mercury dashboard displays `postedAt`, so a date range may
 differ slightly from the UI.
 
+### Returns for the Phase 1 and 2 tools
+
+```text
+list_entities               entities[] {entity, display_name, token_configured}
+server_info                 name, version, api_base, entity_count, entities_with_token, transport, read_only,
+                            documents_enabled
+list_accounts               entity, duplicates_dropped, accounts[] {id, name, nickname, legalBusinessName, kind, type,
+                            status, availableBalance, currentBalance, createdAt, canReceiveTransactions,
+                            dashboardLink, accountNumberLast4}
+list_transactions           entity, filters, count, truncated, duplicates_dropped, transactions[] {id, accountId,
+                            amount, status, kind, createdAt, postedAt, estimatedDeliveryDate, failedAt,
+                            reasonForFailure, counterpartyId, counterpartyName, counterpartyNickname,
+                            bankDescription, externalMemo, note, mercuryCategory,
+                            categoryData {id, name, visibleForCardSpend, visibleForOther, visibleForReimbursements},
+                            merchant {id, category, categoryCode, currency, amount}, checkNumber, cardId,
+                            currencyExchangeInfo {convertedFromAmount, convertedFromCurrency, convertedToAmount,
+                            convertedToCurrency, exchangeRate, feeAmount, feePercentage, feeTransactionId},
+                            dashboardLink}
+list_recipients             entity, count, duplicates_dropped, recipients[] {id, name, nickname, status,
+                            defaultPaymentMethod, dateLastPaid, emails [strings], contactEmail, isBusiness}
+list_tax_docs               see the `list_tax_docs` section below (documents[] {id, recipientId, recipientName,
+                            fileName, formType, uploadedAt})
+reportable_totals           see the `reportable_totals` section below
+```
+
 ### Returns for the Phase 3 tools
 
 ```text
 get_org                     entity, organization {id, legalBusinessName, dbas [{dbaName, dbaIsDefault}], kind,
                             subscriptionTier, billingCadence, einLast4}
-list_statements             entity, account_id, filters, count, truncated,
+list_statements             entity, account_id, filters, count, truncated, duplicates_dropped,
                             statements[] {id, startDate, endDate, endingBalance, companyLegalName,
                             accountNumberLast4, einLast4, transactionCount}
 get_statement_pdf           content[0] text {entity, statement_id, mimeType, bytes, encoding, redacted: false};
                             content[1] embedded resource {uri, mimeType: application/pdf, blob (base64)}
-list_treasury               entity, count, treasury_accounts[] {id, status, availableBalance, currentBalance,
+list_treasury               entity, count, duplicates_dropped, treasury_accounts[] {id, status, availableBalance, currentBalance,
                             createdAt, netReturns[] {month, netAmount, treasuryFee, status,
                             dividends[] {id, type, securityName, amount}}}
-list_treasury_transactions  entity, treasury_id, filters, count, truncated, transactions[] {id, accountId, type,
+list_treasury_transactions  entity, treasury_id, filters, count, truncated, duplicates_dropped, transactions[] {id, accountId, type,
                             amount, balance, canonicalDay, description, additionalDetails, security,
                             details {creditDescription, depositCounterpartyId, feeDescription,
                             manualAmendmentDescription, security, sweepDirection, tradeAction,
                             withdrawalCounterpartyId}}
-list_treasury_statements    entity, treasury_id, filters, count, statements[] {id, accountId, documentType,
+list_treasury_statements    entity, treasury_id, filters, count, duplicates_dropped, statements[] {id, accountId, documentType,
                             description, periodStart, periodEnd, creationDate, createdAt, updatedAt}
 list_credit_accounts        entity, count, credit_accounts[] {id, status, availableBalance, currentBalance, createdAt}
-list_cards                  entity, filters, count, truncated, cards[] {id, accountId, userId, nameOnCard, nickname,
+list_cards                  entity, filters, count, truncated, duplicates_dropped, cards[] {id, accountId, userId, nameOnCard, nickname,
                             lastFour, kind, type, status, physicalCardStatus, isAgentCard, spendLimitType,
                             spendLimit {amountCents, atmAmountCents, interval},
                             budgets[] {id, name, amountCents, remainingAmountCents}, merchantLock {id, name},
                             categoryLocks [strings], createdAt, updatedAt}
 get_card                    entity, card {same fields as one list_cards row}
-list_categories             entity, count, categories[] {id, name, visibleForCardSpend, visibleForOther,
+list_categories             entity, count, duplicates_dropped, categories[] {id, name, visibleForCardSpend, visibleForOther,
                             visibleForReimbursements}
-list_merchants              entity, filters, count, truncated, merchants[] {id, name}
-list_customers              entity, count, customers[] {id, name, email, deletedAt}
-list_invoices               entity, filters, count, truncated, invoices[] {id, invoiceNumber, status, amount,
+list_merchants              entity, filters, count, truncated, duplicates_dropped, merchants[] {id, name}
+list_customers              entity, count, duplicates_dropped, customers[] {id, name, email, deletedAt}
+list_invoices               entity, filters, count, truncated, duplicates_dropped, invoices[] {id, invoiceNumber, status, amount,
                             currencyCode, customerId, destinationAccountId, invoiceDate, dueDate, createdAt,
                             updatedAt, canceledAt, poNumber, payerMemo, internalNote, ccEmails, achDebitEnabled,
                             creditCardEnabled, useRealAccountNumber}
@@ -373,11 +435,11 @@ get_invoice                 entity, invoice {list fields + servicePeriodStartDat
                             lineItems[] {name, quantity, unitPrice, salesTaxRate}}
 get_invoice_pdf             same two blocks as get_statement_pdf, keyed by invoice_id
 list_invoice_attachments    entity, invoice_id, count, attachments[] {id, fileName}
-list_users                  entity, count, users[] {userId, firstName, lastName, email, organizationRole}
-list_events                 entity, filters, count, truncated, events[] {id, resourceType,
+list_users                  entity, count, duplicates_dropped, users[] {userId, firstName, lastName, email, organizationRole}
+list_events                 entity, filters, count, truncated, duplicates_dropped, events[] {id, resourceType,
                             resourceId, operationType, resourceVersion, occurredAt, changedPaths, mergePatch,
                             previousValues, patchOmitted?}
-list_webhooks               entity, count, webhooks[] {id, url_fingerprint (first 8 hex chars of sha256 of the
+list_webhooks               entity, count, duplicates_dropped, webhooks[] {id, url_fingerprint (first 8 hex chars of sha256 of the
                             receiver URL), status, enabled, eventTypes, filterPaths, createdAt, updatedAt}
 ```
 
@@ -386,12 +448,12 @@ tomorrow at any depth is dropped, not passed through.
 
 Lists keep the API's default order (ascending by an undocumented sort key)
 except transactions, statements, treasury transactions, and events, which
-are requested in API `desc` order. Mercury documents no sort key, so
-chronological (newest-first) order is guaranteed only for windowed calls
-(`since` on events, `start`/`end` on treasury transactions), which sort
-locally on `occurredAt` / `canonicalDay` before `limit` applies; an
-unwindowed call returns the API's `desc` order as is. When `truncated` is
-true, the rows kept are the head of whichever order applies.
+are requested in Mercury API `desc` order. Mercury documents no sort key,
+so chronological (newest-first) order is guaranteed only for windowed
+calls: windowed treasury calls sort by `canonicalDay`, and events with
+`since` sort by `occurredAt`, before `limit` applies. An unwindowed call
+returns Mercury API `desc` order as is. When `truncated` is true, the rows
+kept are the head of whichever order applies.
 
 Where the Mercury API has no server-side filter for a documented argument
 (`since` on events, `start`/`end` on treasury transactions and invoices,
@@ -433,9 +495,11 @@ Recipients group by `counterpartyId` (confidence `high` when it matches a
 recipient from `GET /recipients`, else `medium`) or, failing that, by
 counterparty name (`low`). Id-groups that share a normalised name are
 cross-referenced so a payee split across two ids is visible. The default
-threshold is year-aware: 600 through tax year 2025, 2000 from 2026 (the
-federal 1099-NEC/MISC figure, inflation-indexed from 2027, so pass the
-current value); the resolved value is echoed. A threshold must be a finite
+threshold is year-aware: 600 through tax year 2025, 2000 from 2026
+(inflation-indexed from 2027). It is the default for nonemployee services
+and certain MISC payments; supply the applicable category/year threshold
+(see the IRS instructions for Forms 1099-MISC and 1099-NEC). The resolved
+value is echoed. A threshold must be a finite
 number between 0 and 1,000,000,000; anything else is an error (never
 silently zero). Real-time payments appear under `ach` or `unknown`
 depending on whether the API returns routing details for them.
@@ -450,7 +514,8 @@ status_basis                       ["sent"]
 totals                             reportable_total, reportable_payment_count, recipient_count,
                                    flagged_count, needs_review_total, needs_review_count,
                                    reportable_total_upper_bound (= reportable_total + needs_review_total),
-                                   unclassified_count, transactions_scanned
+                                   unclassified_count, transactions_scanned,
+                                   duplicates_dropped (transaction rows), recipient_duplicates_dropped
 recipients[]                       display_name, recipient_id (known recipient) | null, counterparty_id | null,
                                    grouping (counterparty_id | name | transaction), confidence (high | medium | low),
                                    total, payment_count, by_method {label: {count, total}}, flagged,
@@ -477,9 +542,10 @@ Returns:
 ```text
 entity
 document_count, recipient_count, recipients_with_docs
+duplicates_dropped                 {attachments, recipients}
 documents[]                        id, recipientId, recipientName | null, fileName (verbatim third-party text),
                                    formType (w9 | w8BEN | w8BENE | unknown | null), uploadedAt
-recipients_without_docs[]          id, name, status   (every recipient of any status with no attachment)
+recipients_without_docs[]          id, name | null, status | null   (every recipient of any status with no attachment)
 ```
 
 Download URLs are never returned.
