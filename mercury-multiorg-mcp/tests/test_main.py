@@ -206,3 +206,10 @@ def test_main_installs_hooks_and_quiets_http_loggers(clean_env, no_run, monkeypa
     assert sys.excepthook is not before
     assert logging.getLogger("httpx").level == logging.WARNING
     assert logging.getLogger("httpcore").level == logging.WARNING
+
+
+def test_api_base_with_credentials_exits_2_without_echoing_them(clean_env, capsys, no_run):
+    assert main(["--entities", str(EXAMPLE_REGISTRY), "--api-base", "https://user:hunter2@api.mercury.com"]) == 2
+    err = capsys.readouterr().err
+    assert "credentials" in err and "hunter2" not in err
+    assert no_run == []

@@ -288,6 +288,9 @@ def test_needs_review_buckets(report):
         "would_flag": True,
         "sample_transaction_ids": ["bbbbbbbb-0044-4bbb-8bbb-bbbbbbbbbbbb"],
         "hint": BUCKET_HINTS["linked_account_transfers"],
+        "possible_same_payee": [],
+        "name_merged_total": 3000.0,
+        "would_flag_merged": False,
     }
     # name-only aggregation normalises case and whitespace across rows
     assert lit["counterparty_id"] is None and lit["count"] == 2 and lit["total"] == 2050.0
@@ -479,3 +482,35 @@ def test_classifier_output_never_carries_bank_coordinates(dataset, report):
     assert "details" not in dumped
     assert "RoutingInfo" not in dumped
     assert "address1" not in dumped
+
+
+def test_needs_review_same_payee_under_two_ids_is_merged_for_review():
+    """'ACME LLC' and 'Acme Llc' under two counterparty ids: each below the threshold, together above it."""
+    rows = [
+        {"id": "a", "kind": "other", "status": "sent", "amount": -1200, "postedAt": "2026-02-01T00:00:00Z", "counterpartyId": "id-1", "counterpartyName": "ACME LLC"},
+        {"id": "b", "kind": "other", "status": "sent", "amount": -900, "postedAt": "2026-03-01T00:00:00Z", "counterpartyId": "id-2", "counterpartyName": "Acme  Llc"},
+        {"id": "c", "kind": "other", "status": "sent", "amount": -50, "postedAt": "2026-03-02T00:00:00Z", "counterpartyName": "acme llc"},  # name-only: not part of the id merge
+        {"id": "d", "kind": "externalTransfer", "status": "sent", "amount": -10, "postedAt": "2026-03-03T00:00:00Z", "counterpartyId": "id-3", "counterpartyName": "ACME LLC"},  # other bucket: separate
+    ]
+    report = summarize(rows, year=2026, threshold=2000)
+    unlabeled = {e["counterparty_id"] or e["display_name"]: e for e in report["needs_review"]["unlabeled_debits"]}
+    one, two = unlabeled["id-1"], unlabeled["id-2"]
+    assert one["would_flag"] is False and two["would_flag"] is False
+    assert one["possible_same_payee"] == ["id-2"] and two["possible_same_payee"] == ["id-1"]
+    assert one["name_merged_total"] == two["name_merged_total"] == 2100.0
+    assert one["would_flag_merged"] is True and two["would_flag_merged"] is True
+    name_only = unlabeled["ACME LLC"] if "ACME LLC" in unlabeled else unlabeled["acme llc"]
+    assert name_only["counterparty_id"] is None and name_only["possible_same_payee"] == [] and name_only["would_flag_merged"] is False
+    linked = report["needs_review"]["linked_account_transfers"][0]
+    assert linked["counterparty_id"] == "id-3" and linked["possible_same_payee"] == [] and linked["name_merged_total"] == 10.0
+    # totals are unaffected by the cross-reference
+    assert report["totals"]["needs_review_total"] == 2160.0 and report["totals"]["reportable_total"] == 0.0
+
+
+def test_needs_review_merge_below_threshold_is_not_flagged():
+    rows = [
+        {"id": "a", "kind": "other", "status": "sent", "amount": -100, "postedAt": "2026-02-01T00:00:00Z", "counterpartyId": "id-1", "counterpartyName": "Small Co"},
+        {"id": "b", "kind": "other", "status": "sent", "amount": -100, "postedAt": "2026-03-01T00:00:00Z", "counterpartyId": "id-2", "counterpartyName": "SMALL CO"},
+    ]
+    entries = summarize(rows, year=2026, threshold=500)["needs_review"]["unlabeled_debits"]
+    assert all(e["name_merged_total"] == 200.0 and e["would_flag_merged"] is False and len(e["possible_same_payee"]) == 1 for e in entries)

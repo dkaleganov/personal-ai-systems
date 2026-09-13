@@ -135,6 +135,9 @@ def test_config_errors_exit_2(clean_env, capsys, tmp_path):
     assert main(["--entities", str(tmp_path / "missing.yaml")]) == EXIT_CONFIG
     assert main(["--entities", str(EXAMPLE_REGISTRY), "--api-base", "http://api.mercury.com"]) == EXIT_CONFIG
     assert "https" in capsys.readouterr().err
+    assert main(["--entities", str(EXAMPLE_REGISTRY), "--api-base", "https://u:hunter2@api.mercury.com"]) == EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "credentials" in err and "hunter2" not in err
 
 
 def test_env_file_and_entities_env_var(clean_env, monkeypatch, capsys, tmp_path, fake_api, factory):

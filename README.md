@@ -21,6 +21,16 @@ AI builder, photographer, and animator on the weekends.
   by default, no delete ever, per-account encrypted tokens, and a
   CLAUDE.md so Claude Code can walk you through your own setup.
 
+- **mercury-multiorg-mcp/** — A read-only MCP server over several Mercury
+  banking organizations at once (the official connector binds one org
+  per connection): balances, transactions, statements and PDFs,
+  treasury, cards, invoices, a 1099 pre-filing cross-check, and a
+  keepalive CLI. Never a write endpoint, never a full account number.
+
+- **qbo-multicompany-mcp/** — Currently a build brief only (a CLAUDE.md
+  design for a read-only multi-company QuickBooks Online MCP server);
+  no code yet.
+
 ## Why this exists
 
 The bottleneck on personal AI is not access to AI. It is the work of

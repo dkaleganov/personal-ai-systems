@@ -48,6 +48,8 @@ _RETRY_STATUSES = frozenset({429, 502, 503, 504})
 
 # Largest binary (statement / invoice PDF) the client will buffer.
 MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024
+# Largest error body read on a streamed response before it is scrubbed and truncated.
+ERROR_BODY_CAP = 64 * 1024
 
 # Mercury ids are UUIDs. Anything that could change the request path (a
 # slash, a dot segment, a query) is rejected before it reaches the URL.
@@ -73,15 +75,25 @@ def validate_api_base(url: str) -> str:
     """Require ``https://`` for the API host; plain ``http://`` only on loopback (mocks).
 
     Returns the host URL with any trailing slash removed. Raises ``ValueError``
-    with a message safe to print.
+    with a message safe to print: the rejected value is never echoed, since a
+    mistyped URL can carry a credential in its userinfo, path, or query.
     """
     candidate = (url or "").strip().rstrip("/")
-    parts = urlsplit(candidate)
-    host = (parts.hostname or "").lower()
+    try:
+        parts = urlsplit(candidate)
+        host = (parts.hostname or "").lower()
+        parts.port  # noqa: B018  (raises ValueError for a non-numeric port)
+    except ValueError:
+        raise ValueError(f"api_base must be a bare https:// host such as {DEFAULT_API_BASE}; the value could not be parsed") from None
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        raise ValueError(f"api_base must be a bare https:// host such as {DEFAULT_API_BASE} with no credentials in the URL")
     if not host or parts.scheme not in ("http", "https") or parts.path or parts.query or parts.fragment:
-        raise ValueError(f"api_base must be a bare https:// host such as {DEFAULT_API_BASE}; got {url!r}")
+        raise ValueError(
+            f"api_base must be a bare https:// host such as {DEFAULT_API_BASE} "
+            f"(scheme and host only; no path, query, or fragment); got scheme {parts.scheme or 'none'!r}, host {host or 'none'!r}"
+        )
     if parts.scheme == "http" and host not in _LOOPBACK_HOSTS:
-        raise ValueError(f"api_base must use https:// (plain http is only allowed for localhost/127.0.0.1); got {url!r}")
+        raise ValueError(f"api_base must use https:// (plain http is only allowed for localhost/127.0.0.1); got host {host!r}")
     return candidate
 
 
@@ -175,7 +187,8 @@ class MercuryClient:
 
         Returns ``(body, content_type)``. A ``Content-Length`` above the cap
         fails before any body is read; a body that grows past the cap while
-        streaming fails as soon as it does.
+        streaming fails as soon as it does; an error body is read to at most
+        ``ERROR_BODY_CAP`` before being scrubbed.
         """
         resp = await self._fetch(path, None, stream=True)
         try:
@@ -251,7 +264,7 @@ class MercuryClient:
 
             if resp.status_code >= 400:
                 try:
-                    await resp.aread()
+                    raw = await self._read_capped(resp, ERROR_BODY_CAP) if stream else resp.content
                 except httpx.HTTPError as exc:
                     await resp.aclose()
                     raise MercuryAPIError(
@@ -261,7 +274,7 @@ class MercuryClient:
                     ) from None
                 # Scrub first, then truncate: a cut in the middle of a token
                 # would otherwise defeat the token-shape pattern.
-                body = self._scrub(resp.text)[:500]
+                body = self._scrub(raw.decode("utf-8", "replace"))[:500]
                 await resp.aclose()
                 raise MercuryAPIError(
                     f"Mercury returned HTTP {resp.status_code} for GET {path}: {body}",
@@ -269,6 +282,18 @@ class MercuryClient:
                     path=path,
                 )
             return resp
+
+    @staticmethod
+    async def _read_capped(resp: httpx.Response, cap: int) -> bytes:
+        """Read at most ``cap`` bytes of a streamed body (error bodies never need more)."""
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in resp.aiter_bytes():
+            chunks.append(chunk[: cap - size])
+            size += len(chunk)
+            if size >= cap:
+                break
+        return b"".join(chunks)
 
     @staticmethod
     def _backoff_seconds(resp: httpx.Response | None, attempt: int) -> float:
@@ -379,8 +404,13 @@ class MercuryClient:
         """``GET /account/{id}/statements``, newest first (API default ``desc``).
 
         DOCS: ``start``/``end`` filter on the statement *period start* date
-        (YYYY-MM-DD) and may span at most 3 months; treasury and credit
-        accounts are not served by this endpoint.
+        (YYYY-MM-DD) and may span at most 3 months (checked client-side too).
+        Treasury and credit accounts are documented as unsupported here, yet
+        the changelog "Credit Statement Endpoint: Updated balance and
+        transaction behavior" (2026-06) describes credit-account statements
+        from "the statement endpoint"; if credit statements are served, only
+        the depository fields in the allowlist surface (autopay and
+        credit-specific fields are not projected).
         """
         account_id = validate_path_id(account_id, "account_id")
         return await self._paginate(
@@ -451,7 +481,7 @@ class MercuryClient:
                     break
             collected.extend(rows)
             nxt = data.get("cursor")
-            if not rows or not isinstance(nxt, int) or isinstance(nxt, bool) or (cursor is not None and nxt <= cursor):
+            if not rows or not isinstance(nxt, int) or isinstance(nxt, bool) or nxt == cursor:  # non-advancing cursor
                 break
             cursor = nxt
         else:
@@ -533,9 +563,36 @@ class MercuryClient:
         return data
 
     async def get_invoice_pdf(self, invoice_id: str, *, max_bytes: int = MAX_DOWNLOAD_BYTES) -> tuple[bytes, str]:
-        """``GET /ar/invoices/{id}/pdf``: binary PDF, capped. Returns ``(body, content_type)``."""
+        """``GET /ar/invoices/{id}/pdf``: binary PDF, capped. Returns ``(body, content_type)``.
+
+        DOCS: the reference page types the path parameter as the invoice
+        uuid (``invoiceId``), while the invoice schema says the public
+        ``slug`` is "used to construct ... the URL to retrieve the PDF".
+        Both are tried: the id first; on 404 the invoice is fetched and its
+        slug used instead. The slug never leaves the client: errors name the
+        invoice id only.
+        """
         invoice_id = validate_path_id(invoice_id, "invoice_id")
-        return await self._download(f"/ar/invoices/{invoice_id}/pdf", max_bytes=max_bytes)
+        id_path = f"/ar/invoices/{invoice_id}/pdf"
+        try:
+            return await self._download(id_path, max_bytes=max_bytes)
+        except MercuryAPIError as exc:
+            if exc.status_code != 404:
+                raise
+            by_id = exc
+        invoice = await self.get_invoice(invoice_id)
+        slug = invoice.get("slug")
+        if not isinstance(slug, str) or not _PATH_ID_RE.fullmatch(slug):
+            raise by_id
+        try:
+            return await self._download(f"/ar/invoices/{slug}/pdf", max_bytes=max_bytes)
+        except MercuryAPIError as exc:
+            message = str(exc).replace(slug, invoice_id)
+            raise MercuryAPIError(
+                f"{message} (invoice {invoice_id}: not found by id, then tried by slug)",
+                status_code=exc.status_code,
+                path=id_path,
+            ) from None
 
     async def list_invoice_attachments(self, invoice_id: str) -> list[dict[str, Any]]:
         """``GET /ar/invoices/{id}/attachments``: ``{"attachments": [{id, fileName, url}]}`` (not paginated)."""
@@ -567,7 +624,8 @@ class MercuryClient:
         ids are time-based (UUIDv1), so ``desc`` is taken to mean newest
         first. A ``since`` window is applied client-side on that assumption
         by walking newest-first and stopping at the first event older than
-        wanted (``stop_at``).
+        wanted (``stop_at``); the server tool verifies the ordering as it
+        goes and falls back to a full walk if a page breaks it.
         """
         if order not in ("asc", "desc"):
             raise ValueError("order must be 'asc' or 'desc'")
@@ -598,7 +656,9 @@ class MercuryClient:
         """Walk a ``start_after`` cursor until exhausted or ``max_items`` collected.
 
         ``stop_at`` (for server-ordered streams) ends the walk at the first
-        item it accepts; that item and everything after it are dropped.
+        item it accepts; that item and everything after it are dropped. It
+        is called on every item of a page before the cut is applied, and a
+        predicate exposing a true ``disabled`` attribute cancels the cut.
         ``id_key`` names the item's id field (``userId`` on /users).
 
         DOCS: the OpenAPI describes ``page.nextPage`` only as an ID and
@@ -628,8 +688,12 @@ class MercuryClient:
             for it in fresh:
                 seen.add(it.get(id_key))
             if stop_at is not None:
-                cut = next((i for i, it in enumerate(fresh) if stop_at(it)), None)
-                if cut is not None:
+                # Evaluate every row (a stateful predicate may need to see the
+                # whole page); only then honour the first stop, and never if
+                # the predicate disabled itself meanwhile.
+                flags = [stop_at(it) for it in fresh]
+                cut = next((i for i, flag in enumerate(flags) if flag), None)
+                if cut is not None and not getattr(stop_at, "disabled", False):
                     collected.extend(fresh[:cut])
                     break
             collected.extend(fresh)

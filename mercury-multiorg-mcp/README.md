@@ -6,12 +6,12 @@ tokens are single-organization per connection; this server holds one
 read-only token per org and routes every tool call by an explicit `entity`
 key.
 
-Status: **Phase 3** (core tools, 1099 cross-check, keepalive CLI, and the
-holistic read surface: organization, statements and PDFs, treasury,
-credit, cards, categories, merchants, accounts receivable, users, events,
-webhooks). See `CLAUDE.md` for the build brief and the release pass still
-to come. The complete tool reference with every returned field is in
-[docs/tools.md](docs/tools.md).
+Version 0.1.0. The maintainer tags releases as `mercury-vX.Y.Z` on the
+monorepo; find the commit to pin with
+`git ls-remote --tags https://github.com/dkaleganov/personal-ai-systems 'mercury-v0.1.0^{}'`.
+The complete tool reference with every returned field is in
+[docs/tools.md](docs/tools.md); design notes and the build history are in
+`CLAUDE.md`.
 
 ## Security model
 
@@ -32,6 +32,8 @@ to come. The complete tool reference with every returned field is in
   organization). Routing numbers, IBANs, SWIFT codes, counterparty bank
   details, postal addresses, card expiry, presigned download URLs, invoice
   pay-page slugs, and webhook signing secrets are never returned.
+  Webhook receiver URLs are reduced to their origin plus a path
+  fingerprint, since the capability token usually sits in the path.
   `reportable_totals` reads counterparty bank details internally to tell
   ACH from wire from check, and returns only the method label. Event
   patches are re-projected through the changed resource's allowlist.
@@ -50,7 +52,8 @@ to come. The complete tool reference with every returned field is in
 From a clone:
 
 ```bash
-cd mercury-multiorg-mcp
+git clone https://github.com/dkaleganov/personal-ai-systems.git   # or git@github.com:dkaleganov/personal-ai-systems.git
+cd personal-ai-systems/mercury-multiorg-mcp
 uv sync
 uv run mercury-multiorg-mcp --entities /private/path/entities.yaml
 ```
@@ -123,6 +126,34 @@ at your private registry:
 }
 ```
 
+### Claude Desktop
+
+Claude Desktop reads `claude_desktop_config.json` (Settings → Developer →
+Edit Config). It does **not** expand `${VAR}` placeholders, so put the
+token env vars in a private dotenv file and pass `--env-file` (existing
+process env vars still win):
+
+```json
+{
+  "mcpServers": {
+    "mercury-multiorg": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/dkaleganov/personal-ai-systems@<FULL_COMMIT_SHA>#subdirectory=mercury-multiorg-mcp",
+        "mercury-multiorg-mcp",
+        "--entities",
+        "/private/path/entities.yaml",
+        "--env-file",
+        "/private/path/mercury.env"
+      ]
+    }
+  }
+}
+```
+
+Keep both files outside any repository and readable only by your user.
+
 ## Tools
 
 Every tool below takes `entity` first (except the two registry tools) and
@@ -155,8 +186,8 @@ and `truncated`. Full field-by-field reference: [docs/tools.md](docs/tools.md).
 | `get_invoice_pdf` | `entity`, `invoice_id` | the invoice PDF as an embedded blob (≤ 10 MB) |
 | `list_invoice_attachments` | `entity`, `invoice_id` | attachment ids and file names (no URLs) |
 | `list_users` | `entity` | users: id, first and last name, email, role |
-| `list_events` | `entity`, `since?`, `resource_type?`, `limit=100` | change events, newest first, patches re-projected per resource allowlist |
-| `list_webhooks` | `entity` | webhook endpoints: id, url (no credentials or query string), status, `enabled`, event types, filter paths (never the secret) |
+| `list_events` | `entity`, `since?`, `resource_type?`, `limit=100` | change events, newest first (`order_verified` reports whether the feed really was), patches re-projected per resource allowlist |
+| `list_webhooks` | `entity` | webhook endpoints: id, url origin, `path_fingerprint`, status, `enabled`, event types, filter paths (never the secret or the path) |
 
 `start` / `end` on `list_transactions` filter on `createdAt` (`YYYY-MM-DD` or
 ISO 8601). The Mercury dashboard displays `postedAt`, so a date range may
@@ -196,11 +227,11 @@ get_invoice                 entity, invoice {list fields + servicePeriodStartDat
 get_invoice_pdf             same two blocks as get_statement_pdf, keyed by invoice_id
 list_invoice_attachments    entity, invoice_id, count, attachments[] {id, fileName}
 list_users                  entity, count, users[] {userId, firstName, lastName, email, organizationRole}
-list_events                 entity, filters, count, truncated, events[] {id, resourceType, resourceId,
-                            operationType, resourceVersion, occurredAt, changedPaths, mergePatch, previousValues,
-                            patchOmitted?}
-list_webhooks               entity, count, webhooks[] {id, url (scheme, host, path only), status, enabled,
-                            eventTypes, filterPaths, createdAt, updatedAt}
+list_events                 entity, filters, order_verified, count, truncated, events[] {id, resourceType,
+                            resourceId, operationType, resourceVersion, occurredAt, changedPaths, mergePatch,
+                            previousValues, patchOmitted?}
+list_webhooks               entity, count, webhooks[] {id, url (scheme://host[:port] only), path_fingerprint,
+                            status, enabled, eventTypes, filterPaths, createdAt, updatedAt}
 ```
 
 Lists keep the API's default order (ascending by an undocumented sort key)
@@ -270,7 +301,8 @@ recipients[]                       display_name, recipient_id (known recipient) 
                                    name_merged_total, flagged_for_review
 needs_review                       {linked_account_transfers: [...], unlabeled_debits: [...]}; each entry:
                                    display_name, counterparty_id | null, count, total, by_kind {kind: {count, total}},
-                                   would_flag (total >= threshold), sample_transaction_ids (max 3), hint (fixed string)
+                                   would_flag (total >= threshold), sample_transaction_ids (max 3), hint (fixed string),
+                                   possible_same_payee [ids], name_merged_total, would_flag_merged
 unclassified[]                     id, kind, status, amount, postedAt, counterpartyName, reason
 excluded_summary                   {category: {count, amount (signed, as returned by Mercury)}}
 ```

@@ -1,10 +1,16 @@
 """Allowlist projections: the only way a Mercury object leaves this server.
 
 Every tool result is an explicit projection of the live schema, never the
-raw object. Each allowlist below copies field names verbatim from the
-schema page named in its comment and enumerates every excluded field with
-a reason. Extend them deliberately; a field that is not listed does not
-leave the server.
+raw object. Each allowlist below copies top-level field names verbatim
+from the schema page named in its comment and enumerates every excluded
+top-level field with a reason. Extend them deliberately; a top-level field
+that is not listed does not leave the server. Nested objects that ARE
+listed (transaction ``merchant``, ``categoryData``, ``currencyExchangeInfo``;
+organization ``dbas``; treasury ``netReturns`` and ``details``; card
+``spendLimit``, ``budgets``, ``merchantLock``; invoice ``lineItems``) pass
+through as the API returns them; their shapes are documented in
+docs/tools.md and pinned by tests against the fixtures so schema drift
+fails review.
 
 Masking rules (Phase 1, unchanged): account numbers only as ``...Last4``;
 routing numbers, IBANs, SWIFT codes, counterparty bank coordinates, tax ids
@@ -14,12 +20,13 @@ card expiry never leave the server.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
-# ALLOWLIST of fields copied verbatim from the live Mercury `Account` schema
-# (docs.mercury.com/reference/getaccounts, 2026-09-11). Anything not listed
-# here never leaves the server. Deliberately excluded:
+# ALLOWLIST of top-level fields copied verbatim from the live Mercury
+# `Account` schema (docs.mercury.com/reference/getaccounts, 2026-09-11). A
+# top-level field not listed here never leaves the server. Deliberately excluded:
 #   accountNumber          -> replaced by `accountNumberLast4`
 #   routingNumber          -> dropped; an AI transcript is no place for full
 #                             bank coordinates and no read-only workflow needs them
@@ -39,9 +46,12 @@ _ACCOUNT_FIELDS = (
     "dashboardLink",
 )
 
-# ALLOWLIST of fields copied verbatim from the live Mercury `Transaction`
-# schema (docs.mercury.com/reference/listtransactions, 2026-09-11). Anything
-# not listed here never leaves the server. Deliberately excluded:
+# ALLOWLIST of top-level fields copied verbatim from the live Mercury
+# `Transaction` schema (docs.mercury.com/reference/listtransactions,
+# 2026-09-11). A top-level field not listed here never leaves the server;
+# the listed nested objects `merchant`, `categoryData`, and
+# `currencyExchangeInfo` pass through as returned (shapes pinned by tests).
+# Deliberately excluded:
 #   details                  -> counterparty routing/account numbers (TransactionMethodData)
 #   attachments              -> filenames/URLs; Phase 3 surfaces attachments explicitly
 #   glAllocations            -> bookkeeping allocations; not needed for Phase 1/2
@@ -309,22 +319,31 @@ _EVENT_FIELDS = (
     "occurredAt",
     "changedPaths",
 )
+# Event patches for account resources also carry `inFlightBalance`, which
+# the webhook `filterPaths` enum documents for all five account types but
+# which no GET schema exposes. It is allowed on event patches only.
+_EVENT_ACCOUNT_PATCH_FIELDS = _ACCOUNT_FIELDS + ("inFlightBalance",)
+_EVENT_TREASURY_PATCH_FIELDS = _TREASURY_ACCOUNT_FIELDS + ("inFlightBalance",)
+_EVENT_CREDIT_PATCH_FIELDS = _CREDIT_ACCOUNT_FIELDS + ("inFlightBalance",)
 _EVENT_PATCH_FIELDS: dict[str, tuple[str, ...]] = {
     "transaction": _TRANSACTION_FIELDS,
-    "checkingAccount": _ACCOUNT_FIELDS,
-    "savingsAccount": _ACCOUNT_FIELDS,
-    "treasuryAccount": _TREASURY_ACCOUNT_FIELDS,
-    "investmentAccount": _TREASURY_ACCOUNT_FIELDS,
-    "creditAccount": _CREDIT_ACCOUNT_FIELDS,
+    "checkingAccount": _EVENT_ACCOUNT_PATCH_FIELDS,
+    "savingsAccount": _EVENT_ACCOUNT_PATCH_FIELDS,
+    "treasuryAccount": _EVENT_TREASURY_PATCH_FIELDS,
+    "investmentAccount": _EVENT_TREASURY_PATCH_FIELDS,
+    "creditAccount": _EVENT_CREDIT_PATCH_FIELDS,
 }
 
 # ALLOWLIST for `ApiWebhookResponse` (docs.mercury.com/reference/getwebhooks,
 # 2026-09-12). Deliberately excluded:
 #   secret -> signing secret; the docs say GET never returns it, and it is
 #             dropped here regardless
-# `url` is returned as scheme://host/path only: receiver URLs routinely
-# carry a capability token in the query string or credentials in the
-# userinfo, which are secrets in the same sense as `secret`.
+# `url` is reduced to its origin (scheme://host[:port]) plus
+# `path_fingerprint`, the first 8 hex chars of sha256(path): receiver URLs
+# routinely carry the capability token in the PATH (Slack /services/T/B/<token>,
+# Discord /api/webhooks/<id>/<token>, Zapier, Make, n8n), the query string,
+# or the userinfo, and those are secrets in the same sense as `secret`. The
+# fingerprint keeps two hooks on one host distinguishable.
 _WEBHOOK_FIELDS = (
     "id",
     "url",
@@ -426,7 +445,7 @@ def project_event(ev: dict[str, Any]) -> dict[str, Any]:
             out[key] = None
         elif isinstance(value, dict) and fields is not None:
             patch = _project(value, fields)
-            if fields is _ACCOUNT_FIELDS and "accountNumber" in value:
+            if fields is _EVENT_ACCOUNT_PATCH_FIELDS and "accountNumber" in value:
                 patch["accountNumberLast4"] = _last4(value.get("accountNumber"))
             out[key] = patch
         else:
@@ -437,23 +456,29 @@ def project_event(ev: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _strip_url_secrets(url: Any) -> Any:
-    """Drop userinfo, query string, and fragment from a URL; keep scheme, host, port, path."""
+def _url_origin_and_path_fingerprint(url: Any) -> tuple[str | None, str | None]:
+    """``(scheme://host[:port], sha256(path)[:8])`` for a URL; ``(None, None)`` if it has no usable host."""
     if not isinstance(url, str):
-        return url
+        return None, None
     try:
         parts = urlsplit(url)
+        hostname = parts.hostname
+        port = parts.port  # raises ValueError for a non-numeric port
     except ValueError:
-        return None
-    host = parts.hostname or ""
-    if parts.port is not None:
-        host = f"{host}:{parts.port}"
-    return urlunsplit((parts.scheme, host, parts.path, "", ""))
+        return None, None
+    if not hostname:
+        return None, None
+    host = f"[{hostname}]" if ":" in hostname else hostname  # keep IPv6 literals bracketed
+    if port is not None:
+        host = f"{host}:{port}"
+    origin = f"{parts.scheme}://{host}" if parts.scheme else f"//{host}"
+    fingerprint = hashlib.sha256(parts.path.encode("utf-8")).hexdigest()[:8]
+    return origin, fingerprint
 
 
 def project_webhook(wh: dict[str, Any]) -> dict[str, Any]:
     out = _project(wh, _WEBHOOK_FIELDS)
     if "url" in out:
-        out["url"] = _strip_url_secrets(out["url"])
+        out["url"], out["path_fingerprint"] = _url_origin_and_path_fingerprint(out["url"])
     out["enabled"] = wh.get("status") == "active"
     return out

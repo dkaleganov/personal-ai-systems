@@ -96,7 +96,19 @@ async def test_reportable_totals_needs_review_shape_through_protocol(mcp_client:
     assert unlabeled["Unknown Thing"]["count"] == 2
     for entries in nr.values():
         for e in entries:
-            assert set(e) == {"display_name", "counterparty_id", "count", "total", "by_kind", "would_flag", "sample_transaction_ids", "hint"}
+            assert set(e) == {
+                "display_name",
+                "counterparty_id",
+                "count",
+                "total",
+                "by_kind",
+                "would_flag",
+                "sample_transaction_ids",
+                "hint",
+                "possible_same_payee",
+                "name_merged_total",
+                "would_flag_merged",
+            }
             assert len(e["sample_transaction_ids"]) <= 3
     # neither bucket is in reportable_total; both are in the upper bound
     assert data["totals"]["reportable_total_upper_bound"] == UPPER_BOUND

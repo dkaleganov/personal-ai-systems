@@ -484,8 +484,8 @@ async def test_paginate_stop_at_drops_the_matching_item_and_everything_after(fak
     monkeypatch.setattr(client_mod, "MAX_PAGE_SIZE", 2)
     async with _client(fake_api) as c:
         rows = await c.list_events(order="desc", stop_at=lambda e: e["occurredAt"] < "2026-03-03")
-    assert [r["id"][-1] for r in rows] == ["5", "4", "3"]
-    assert len(fake_api.requests) == 2  # page [5,4], page [3,2] -> stop; page [1] never fetched
+    assert [r["id"][-1] for r in rows] == ["6", "5", "4", "3"]
+    assert len(fake_api.requests) == 3  # pages [6,5], [4,3], [2,1] -> stop at 2; nothing after it is fetched
 
 
 async def test_phase3_client_methods_validate_ids_before_any_request(fake_api):
@@ -555,3 +555,58 @@ async def test_error_body_unreadable_on_streamed_response_is_wrapped():
         with pytest.raises(MercuryAPIError, match="HTTP 403 .* body unreadable") as info:
             await c.get_statement_pdf("66666666-0001-4666-8666-666666666666")
     assert info.value.status_code == 403
+
+
+def test_api_base_rejects_credentials_without_echoing_them():
+    from mercury_multiorg_mcp.client import validate_api_base
+
+    for bad in ("https://user:hunter2@api.mercury.com", "https://user@api.mercury.com", "https://api.mercury.com:notaport"):
+        with pytest.raises(ValueError) as info:
+            validate_api_base(bad)
+        assert "hunter2" not in str(info.value) and "user:" not in str(info.value) and "user@" not in str(info.value)
+    assert validate_api_base("https://api-sandbox.mercury.com/") == "https://api-sandbox.mercury.com"
+    # a credential hidden in the path or query is never echoed either
+    for bad in ("https://api.mercury.com/?token=hunter2", "https://api.mercury.com/hunter2", "http://api.mercury.com/?k=hunter2"):
+        with pytest.raises(ValueError) as info:
+            validate_api_base(bad)
+        assert "hunter2" not in str(info.value)
+
+
+async def test_error_body_on_streamed_response_is_read_to_the_cap_only():
+    import mercury_multiorg_mcp.client as client_mod
+
+    yielded = 0
+
+    class Big(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            nonlocal yielded
+            for _ in range(1000):  # 1000 x 1 KiB = far beyond the 64 KiB cap
+                yielded += 1
+                yield b"x" * 1024
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, stream=Big(), headers={"Content-Type": "text/plain"})
+
+    c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(handler), sleep=_no_sleep, max_retries=0)
+    async with c:
+        with pytest.raises(MercuryAPIError) as info:
+            await c.get_statement_pdf("66666666-0001-4666-8666-666666666666")
+    assert yielded <= client_mod.ERROR_BODY_CAP // 1024 + 1
+    assert len(str(info.value)) < 700 and "HTTP 500" in str(info.value)
+
+
+async def test_treasury_cursor_guard_is_non_advancing_only():
+    """A decreasing cursor is unusual but not a loop by itself; only a repeated cursor stops the walk."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        cursor = request.url.params.get("cursor")
+        nxt = {None: 5, 5: 3, 3: None}[int(cursor) if cursor else None]
+        return httpx.Response(200, json={"transactions": [{"id": f"t{calls}"}], "cursor": nxt})
+
+    c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(handler), sleep=_no_sleep)
+    async with c:
+        rows = await c.list_treasury_transactions("33333333-3333-4333-8333-333333333333")
+    assert [r["id"] for r in rows] == ["t1", "t2", "t3"] and calls == 3

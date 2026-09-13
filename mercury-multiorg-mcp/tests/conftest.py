@@ -43,6 +43,13 @@ _LIST_ROUTES: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
     "/api/v1/events": ("events.json", "events", "asc", ("resourceType", "resourceId")),
     "/api/v1/webhooks": ("webhooks.json", "webhooks", "asc", ("status",)),
 }
+# Enumerated query params the API validates with a 400 (values from the live OpenAPI)
+_ENUM_PARAMS: dict[str, dict[str, set[str]]] = {
+    "/api/v1/cards": {"status": {"active", "frozen", "cancelled", "inactive", "expired", "suspended"}},
+    "/api/v1/events": {"resourceType": {"transaction", "checkingAccount", "savingsAccount", "treasuryAccount", "investmentAccount", "creditAccount"}},
+    "/api/v1/webhooks": {"status": {"active", "paused", "disabled", "deleted"}},
+}
+_TREASURY_DOCUMENT_TYPES = {"MonthlyStatement", "TradeConfirmation", "1099", "1099R", "1042S", "5498", "5498ESA", "1099Q", "FMV", "SDIRA"}
 _ACCOUNT_STATEMENTS_RE = re.compile(r"^/api/v1/account/([^/]+)/statements$")
 _TREASURY_STATEMENTS_RE = re.compile(r"^/api/v1/treasury/([^/]+)/statements$")
 _TREASURY_TXNS_RE = re.compile(r"^/api/v1/treasury/([^/]+)/transactions$")
@@ -75,6 +82,11 @@ class FakeMercury:
         self.pdf_bytes: bytes = FAKE_PDF
         self.pdf_content_type: str = "application/pdf"
         self.pdf_send_content_length: bool = True
+        # Invoice PDF path semantics: when True the uuid path is a 404 and only the slug path serves the PDF
+        self.invoice_pdf_by_slug_only: bool = False
+        self.invoice_pdf_slug_status: int = 200
+        # Per-route row overrides for the generic list routes (path -> rows)
+        self.rows: dict[str, list[dict[str, Any]]] = {}
         self._served = 0
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -122,7 +134,11 @@ class FakeMercury:
             return httpx.Response(200, json=load_fixture("credit_accounts.json"))
         if path in _LIST_ROUTES:
             fixture, key, natural, filters = _LIST_ROUTES[path]
-            rows = load_fixture(fixture)[key]
+            for name, allowed in _ENUM_PARAMS.get(path, {}).items():
+                bad = [v for v in p.get_list(name) if v not in allowed]
+                if bad:
+                    return httpx.Response(400, json={"message": f"Invalid `{name}`: {bad}"})
+            rows = self.rows.get(path) or load_fixture(fixture)[key]
             for name in filters:
                 if name in p:
                     wanted = set(p.get_list(name))
@@ -147,6 +163,8 @@ class FakeMercury:
                 return httpx.Response(404, json={"message": "treasury account not found"})
             rows = load_fixture("treasury_statements.json")["statements"]
             if p.get("documentType"):
+                if p["documentType"] not in _TREASURY_DOCUMENT_TYPES:
+                    return httpx.Response(400, json={"message": "Invalid `documentType`"})
                 rows = [r for r in rows if r["documentType"] == p["documentType"]]
             return httpx.Response(200, json=self._page(rows, "statements", request, "asc"))
         m = _TREASURY_TXNS_RE.match(path)
@@ -175,8 +193,16 @@ class FakeMercury:
             return httpx.Response(404, json={"message": "card not found"})
         m = _INVOICE_PDF_RE.match(path)
         if m:
-            known = {r["id"] for r in load_fixture("invoices.json")["invoices"]}
-            if m.group(1) not in known:
+            invoices = load_fixture("invoices.json")["invoices"]
+            by_id = {r["id"] for r in invoices}
+            by_slug = {r["slug"] for r in invoices}
+            if self.invoice_pdf_by_slug_only:
+                if m.group(1) in by_slug:
+                    if self.invoice_pdf_slug_status != 200:
+                        return httpx.Response(self.invoice_pdf_slug_status, json={"message": "slug path failed"})
+                    return self._pdf_response()
+                return httpx.Response(404, json={"message": "invoice pdf not found by id"})
+            if m.group(1) not in by_id:
                 return httpx.Response(404, json={"message": "invoice not found"})
             return self._pdf_response()
         m = _INVOICE_ATTACHMENTS_RE.match(path)

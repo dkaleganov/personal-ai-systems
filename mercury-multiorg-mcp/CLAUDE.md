@@ -142,7 +142,10 @@ case-normalised counterparty name (`low`). `recipient_id` is set only for
 the `high` case. A post-pass keyed on the normalised display name across
 id-groups emits `possible_same_payee` (the other ids), `name_merged_total`,
 and `flagged_for_review` (merged total ≥ threshold), so the same payee
-under two ids is visible. Amounts are handled as exact cents (Decimal) and
+under two ids is visible. The same post-pass runs inside each
+`needs_review` bucket (`possible_same_payee`, `name_merged_total`,
+`would_flag_merged`) because real data showed one vendor under two ids
+("ACME LLC" / "Acme Llc") sitting below the threshold as two rows. Amounts are handled as exact cents (Decimal) and
 emitted as floats rounded to cents; `threshold` is compared in cents.
 Exhausting the client's `MAX_PAGES` with more pages remaining raises a
 clean `MercuryAPIError` rather than returning a short total.
@@ -173,13 +176,33 @@ Phase 3 — holistic read surface (built 2026-09-12; full reference in
   (no server time filter; `since` client-side newest-first with an early
   stop; `mergePatch`/`previousValues` re-projected through the changed
   resource's allowlist, omitted with `patchOmitted` for unknown types);
-  `list_webhooks` (config view; `secret` never returned; `url` stripped
-  of userinfo, query string, and fragment because receiver URLs often
-  carry a capability token there; `enabled` derived from `status`).
+  `list_webhooks` (config view; `secret` never returned; `url` reduced to
+  its origin `scheme://host[:port]` plus `path_fingerprint` = first 8 hex
+  chars of sha256(path), because receiver URLs carry the capability token
+  in the path (Slack, Discord, Zapier, Make, n8n), query, or userinfo;
+  `enabled` derived from `status`). Event patches for the five account
+  resource types additionally allow `inFlightBalance` (documented in the
+  webhook filterPaths enum, absent from every GET schema): event-only
+  allowlists in `projections.py`.
 - Client-side windows (`since` on events, `start`/`end` on treasury
   transactions) walk newest-first and stop at the first row older than
   the window or once `limit + 1` rows inside it are collected, so an
-  `end`-only window never walks the whole history.
+  `end`-only window never walks the whole history. For events the
+  newest-first assumption is verified as the walk goes
+  (`_OrderedWindowStop`): a row newer than the row before it disables the
+  early stop, the full 90-day feed is walked, and the result carries
+  `order_verified: false`; otherwise `order_verified: true`.
+- `get_invoice_pdf` tries the invoice uuid path first and, on 404, the
+  invoice's `slug` (the docs disagree on which the path takes); the slug
+  never appears in output or error text.
+- `list_statements` validates real calendar dates and enforces Mercury's
+  3-month `start`/`end` span before any request; `list_invoices` matches
+  `status` case-insensitively and rejects unknown values.
+- Allowlists are top-level; nested pass-through objects are documented
+  in docs/tools.md and pinned to their live key sets by
+  `test_nested_pass_through_objects_match_the_live_schema`.
+- `validate_api_base` rejects credentials in the URL without echoing them.
+  Error bodies on streamed downloads are read to at most 64 KB.
 - Every id that becomes a path segment is validated (`validate_path_id`)
   so an argument can never redirect a request to another endpoint.
 - Tools return `list[ContentBlock]` for PDFs; SDK v2 passes content
@@ -234,8 +257,11 @@ stdio only; the server never opens a network listener.
   `formType` (w9 / w8BEN / w8BENE / unknown / null) and a presigned `url`
   valid 12 hours. Recipient `PaymentMethod` includes `realTimePayment`.
 - Phase 3 live-doc findings (2026-09-12): `GET /account/{id}/statements`
-  filters `start`/`end` on the period start date, max 3-month span,
-  and does not serve treasury or credit accounts; `GET /statements/{id}/pdf`
+  filters `start`/`end` on the period start date, max 3-month span, and
+  is documented as not serving treasury or credit accounts (the June 2026
+  changelog "Credit Statement Endpoint" nonetheless describes credit
+  statements from "the statement endpoint"; `list_statements` hedges
+  accordingly and would surface only depository fields); `GET /statements/{id}/pdf`
   takes a bare uuid described as "ID for the account statement"; treasury
   statements carry the same `AccountStatementId` type as depository
   statements, but whether treasury ids work there is undocumented
@@ -342,15 +368,16 @@ not use the third-party standalone `fastmcp` package — official SDK only.
 3. Holistic read surface (get_org, statements + PDF, treasury, credit,
    cards, categories, merchants, AR, users, events, webhooks). Acceptance:
    fixture tests per tool; docs/tools.md complete. Built 2026-09-12.
-4. Release pass: README covering install, config, security model
-   (including the untrusted-output warning), and tool reference; MIT (the
-   monorepo LICENSE applies); gitleaks scan across full history; tag
-   `mercury-v0.1.0`. Acceptance: gitleaks is clean and a fresh clone
-   installs and passes tests from the README alone.
-   Deferred here from the Phase 1 review: add a LICENSE file inside the
-   package so wheels/sdists carry it (`license-files` in pyproject), and
-   drop the deprecated `License :: OSI Approved :: MIT License` classifier
-   in favour of the SPDX `license = "MIT"` expression alone.
+4. Release pass (built 2026-09-12): README covering install (clone,
+   uvx pin, Claude Code, Claude Desktop), config, security model
+   (including the untrusted-output warning), and tool reference; MIT with
+   an in-package LICENSE copied from the monorepo, `license-files` in
+   pyproject, and the deprecated License classifier dropped (verified with
+   `uv build`: METADATA carries `License-File: LICENSE` and both artifacts
+   contain the file); gitleaks scan across full history. The maintainer
+   tags `mercury-v0.1.0` on the monorepo after review. Acceptance: gitleaks
+   is clean and a fresh clone installs and passes tests from the README
+   alone.
 
 ## Definition of done for public
 

@@ -255,7 +255,16 @@
       "merchant": null,
       "checkNumber": null,
       "cardId": null,
-      "currencyExchangeInfo": null,
+      "currencyExchangeInfo": {
+        "convertedFromAmount": 1999.99,
+        "convertedFromCurrency": "USD",
+        "convertedToAmount": 1850.0,
+        "convertedToCurrency": "EUR",
+        "exchangeRate": 0.925,
+        "feeAmount": 19.99,
+        "feePercentage": 0.01,
+        "feeTransactionId": null
+      },
       "dashboardLink": "https://app.mercury.example/transactions/x",
       "details": {
         "internationalWireRoutingInfo": {

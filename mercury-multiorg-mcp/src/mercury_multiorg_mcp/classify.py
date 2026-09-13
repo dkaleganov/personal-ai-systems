@@ -433,10 +433,31 @@ def summarize(
                     "would_flag": group["total"] >= threshold_cents,
                     "sample_transaction_ids": list(group["sample_ids"]),
                     "hint": _hint(bucket, display),
+                    "possible_same_payee": [],
+                    "name_merged_total": _money(group["total"]),
+                    "would_flag_merged": False,
+                    "_total": group["total"],
                 }
             )
             needs_review_total += group["total"]
             needs_review_count += group["count"]
+        # Same post-pass as for recipients: the same payee under several
+        # counterparty ids ("ACME LLC" / "Acme Llc") must not hide below the
+        # threshold as two small rows.
+        siblings_by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for entry in entries:
+            if entry["counterparty_id"] and entry["display_name"] != "(unknown counterparty)":
+                siblings_by_name[_normalize_name(entry["display_name"])].append(entry)
+        for siblings in siblings_by_name.values():
+            if len(siblings) < 2:
+                continue
+            merged = sum((e["_total"] for e in siblings), _ZERO)
+            for entry in siblings:
+                entry["possible_same_payee"] = [e["counterparty_id"] for e in siblings if e is not entry]
+                entry["name_merged_total"] = _money(merged)
+                entry["would_flag_merged"] = merged >= threshold_cents
+        for entry in entries:
+            del entry["_total"]
         entries.sort(key=lambda r: (-r["total"], r["display_name"]))
         needs_review_out[bucket] = entries
 
