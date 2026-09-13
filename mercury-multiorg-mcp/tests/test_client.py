@@ -109,16 +109,17 @@ async def test_429_retries_exhausted_raises_clean_error(fake_api):
     assert FAKE_TOKEN_MAIN not in str(info.value)
 
 
-async def test_error_body_is_redacted(fake_api):
+async def test_error_body_is_never_quoted(fake_api):
+    """M1: an error status is fixed text (status, endpoint label, hint); the body is not even read."""
     fake_api.force_status = 401
     fake_api.force_body = f"Unauthorized: bad header Authorization: Bearer {FAKE_TOKEN_MAIN}"
     async with _client(fake_api) as c:
         with pytest.raises(MercuryAPIError) as info:
             await c.list_accounts()
     msg = str(info.value)
-    assert "401" in msg
-    assert FAKE_TOKEN_MAIN not in msg
-    assert "[REDACTED]" in msg
+    assert msg == "Mercury returned HTTP 401 for GET /accounts: token rejected (the entity's token is invalid, deleted, or for another environment)"
+    assert FAKE_TOKEN_MAIN not in msg and "Unauthorized" not in msg and "[REDACTED]" not in msg
+    assert info.value.status_code == 401 and info.value.path == "/accounts"
 
 
 async def test_transport_error_is_retried_then_wrapped_and_redacted():
@@ -139,10 +140,9 @@ async def test_transport_error_is_retried_then_wrapped_and_redacted():
             await c.list_accounts()
     msg = str(info.value)
     assert calls == ["GET", "GET", "GET"]  # initial + 2 retries, all GET
-    assert "after 3 attempts" in msg
-    assert "connection refused" in msg
-    assert FAKE_TOKEN_MAIN not in msg
-    assert "[REDACTED]" in msg
+    assert msg == "Transport error calling GET /accounts after 3 attempts (ConnectError)"
+    # the exception repr (which carried the request headers) is never quoted, so there is nothing to redact
+    assert "connection refused" not in msg and FAKE_TOKEN_MAIN not in msg and "[REDACTED]" not in msg
 
 
 async def test_transport_error_recovers_on_retry(fake_api):
@@ -171,7 +171,7 @@ async def test_non_transport_httpx_error_is_not_retried():
 
     c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(bad), sleep=_no_sleep)
     async with c:
-        with pytest.raises(MercuryAPIError, match="redirect loop"):
+        with pytest.raises(MercuryAPIError, match=r"HTTP error calling GET /accounts \(TooManyRedirects\)"):
             await c.list_accounts()
     assert calls == 1
 
@@ -211,17 +211,20 @@ def test_retry_after_is_capped_and_non_numeric_falls_back():
     assert MercuryClient._backoff_seconds(None, 10) <= 16.25  # capped
 
 
-async def test_error_body_is_scrubbed_before_truncation(fake_api):
-    fake_api.force_status = 403
-    # Token straddles the 500-char cut; a truncate-then-scrub order would leave a fragment.
-    fake_api.force_body = "x" * 470 + f" Authorization: Bearer {FAKE_TOKEN_MAIN}"
+async def test_error_body_with_bank_coordinates_never_reaches_the_message(fake_api):
+    """M1: a 400 body carrying account/routing numbers (the reviewer's case) is not echoed, whole or in part."""
+    fake_api.force_status = 400
+    fake_api.force_body = (
+        '{"message":"Rejected account record","record":{"routingNumber":"CANARY_ERROR_ROUTING_000000000",'
+        '"accountNumber":"CANARY_ERROR_ACCOUNT_999988887777","downloadUrl":"https://download.example/CANARY?sig=CANARY_SIG"}}'
+    )
     async with _client(fake_api) as c:
         with pytest.raises(MercuryAPIError) as info:
             await c.list_accounts()
     msg = str(info.value)
-    assert FAKE_TOKEN_MAIN not in msg
-    assert FAKE_TOKEN_MAIN[:12] not in msg  # no partial token survives the cut
-    assert "[REDACTED]" in msg
+    assert msg == "Mercury returned HTTP 400 for GET /accounts: request rejected by Mercury (check the arguments)"
+    for needle in ("CANARY", "routingNumber", "accountNumber", "downloadUrl", "Rejected"):
+        assert needle not in msg
 
 
 async def test_empty_page_returns_empty_list(fake_api):
@@ -232,8 +235,10 @@ async def test_empty_page_returns_empty_list(fake_api):
     assert len(fake_api.requests) == 1
 
 
-async def test_pagination_dedupes_and_stops_when_cursor_does_not_advance():
-    """A server that keeps returning the same page with nextPage set must not loop."""
+async def test_pagination_stalled_with_next_page_is_an_error_not_a_short_list():
+    """M6: a server that repeats a page while still advertising nextPage must fail loudly, never loop or truncate."""
+    from mercury_multiorg_mcp.errors import IncompletePaginationError
+
     page = load_fixture("transactions_page1.json")
     calls = 0
 
@@ -244,9 +249,41 @@ async def test_pagination_dedupes_and_stops_when_cursor_does_not_advance():
 
     c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(stuck), sleep=_no_sleep)
     async with c:
-        txns = await c.list_transactions(limit=50)
-    assert [t["id"] for t in txns] == [t["id"] for t in page["transactions"]]
-    assert calls == 2  # second page yielded nothing fresh -> stop
+        with pytest.raises(IncompletePaginationError, match="incomplete pagination") as info:
+            await c.list_transactions(limit=50)
+    assert calls == 2  # the second page contributed nothing fresh while nextPage was still set
+    assert isinstance(info.value, MercuryAPIError) and info.value.path == "/transactions"
+
+
+async def test_pagination_overlapping_pages_that_still_advance_are_deduped():
+    """Dedupe stays: a page that repeats one row but adds fresh ones keeps walking."""
+    pages = {
+        None: ([{"id": "a"}, {"id": "b"}], "b"),
+        "b": ([{"id": "b"}, {"id": "c"}], "c"),
+        "c": ([{"id": "c"}, {"id": "d"}], None),
+    }
+
+    def overlapping(request: httpx.Request) -> httpx.Response:
+        rows, nxt = pages[request.url.params.get("start_after")]
+        return httpx.Response(200, json={"accounts": rows, "page": {"nextPage": nxt, "previousPage": None}})
+
+    c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(overlapping), sleep=_no_sleep)
+    async with c:
+        rows = await c.list_accounts()
+    assert [r["id"] for r in rows] == ["a", "b", "c", "d"]
+
+
+async def test_pagination_page_without_usable_ids_but_next_page_is_an_error():
+    """M6: rows with no id cannot form a cursor; with nextPage set that is an incomplete walk, not a stop."""
+    from mercury_multiorg_mcp.errors import IncompletePaginationError
+
+    def no_ids(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"accounts": [{"name": "x"}], "page": {"nextPage": "more", "previousPage": None}})
+
+    c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(no_ids), sleep=_no_sleep)
+    async with c:
+        with pytest.raises(IncompletePaginationError):
+            await c.list_accounts()
 
 
 async def test_pagination_exhausting_max_pages_is_a_clean_error(monkeypatch):
@@ -368,8 +405,9 @@ async def test_non_json_raises(fake_api):
     fake_api.force_status = 200
     fake_api.force_body = "<html>maintenance</html>"
     async with _client(fake_api) as c:
-        with pytest.raises(MercuryAPIError, match="non-JSON"):
+        with pytest.raises(MercuryAPIError, match="GET /accounts returned a body that is not JSON") as info:
             await c.list_accounts()
+    assert "maintenance" not in str(info.value)  # never quoted
 
 
 def test_api_base_env_override(monkeypatch):
@@ -389,8 +427,9 @@ def test_validate_path_id_rejects_anything_that_could_change_the_path():
 
     assert validate_path_id("11111111-1111-4111-8111-111111111111", "x") == "11111111-1111-4111-8111-111111111111"
     for bad in ("", "../accounts", "a/b", "id?x=1", "id#frag", "id with space", "x" * 65, None, 42, "abc\n", "abc\r"):
-        with pytest.raises(ValueError, match="must be an id"):
+        with pytest.raises(ValueError, match="thing: invalid id format") as info:
             validate_path_id(bad, "thing")  # type: ignore[arg-type]
+        assert bad in ("", None) or str(bad) not in str(info.value)  # M1(b): the value is never echoed
 
 
 async def test_download_caps_by_declared_length_and_by_stream(fake_api):
@@ -405,12 +444,12 @@ async def test_download_caps_by_declared_length_and_by_stream(fake_api):
         with pytest.raises(MercuryAPIError, match="exceeded the 50-byte limit"):
             await c.get_statement_pdf(stmt, max_bytes=50)
         # a body exactly at the cap is fine
-        fake_api.pdf_bytes = b"%PDF-" + b"z" * 45
+        fake_api.pdf_bytes = b"%PDF-" + b"z" * 39 + b"%%EOF\n"
         body, _ = await c.get_invoice_pdf("1a000000-0001-4a00-8a00-1a0000000000", max_bytes=50)
         assert len(body) == 50
 
 
-async def test_download_retries_429_and_redacts_error_bodies(fake_api):
+async def test_download_retries_429_and_never_quotes_error_bodies(fake_api):
     stmt = "66666666-0001-4666-8666-666666666666"
     fake_api.rate_limit_first = 2
     async with _client(fake_api, max_retries=3) as c:
@@ -423,7 +462,9 @@ async def test_download_retries_429_and_redacts_error_bodies(fake_api):
     async with _client(fake2) as c:
         with pytest.raises(MercuryAPIError) as info:
             await c.get_statement_pdf(stmt)
-    assert info.value.status_code == 403 and FAKE_TOKEN_MAIN not in str(info.value) and "[REDACTED]" in str(info.value)
+    msg = str(info.value)
+    assert info.value.status_code == 403 and FAKE_TOKEN_MAIN not in msg and "denied" not in msg
+    assert msg == "Mercury returned HTTP 403 for GET /statements/{id}/pdf: token lacks permission for this endpoint"
 
 
 async def test_treasury_transactions_int_cursor_stop_and_guards(fake_api, monkeypatch):
@@ -440,15 +481,12 @@ async def test_treasury_transactions_int_cursor_stop_and_guards(fake_api, monkey
         fake_api.requests.clear()
         rows = await c.list_treasury_transactions(treasury, limit=3)
         assert len(rows) == 3 and len(fake_api.requests) == 2
-        # stop_at ends the walk on the page where it first matches
-        fake_api.requests.clear()
-        rows = await c.list_treasury_transactions(treasury, stop_at=lambda r: r["canonicalDay"] < "2026-03-01")
-        assert [r["canonicalDay"] for r in rows] == ["2026-03-31", "2026-03-15", "2026-03-01"]
-        assert len(fake_api.requests) == 2
         with pytest.raises(ValueError):
             await c.list_treasury_transactions(treasury, order="sideways")
 
-    # a server whose cursor never advances must not loop
+    # M6: a server whose cursor never advances is an incomplete walk, never a loop and never a short list
+    from mercury_multiorg_mcp.errors import IncompletePaginationError
+
     calls = 0
 
     def stuck(request: httpx.Request) -> httpx.Response:
@@ -458,8 +496,28 @@ async def test_treasury_transactions_int_cursor_stop_and_guards(fake_api, monkey
 
     c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(stuck), sleep=_no_sleep)
     async with c:
-        rows = await c.list_treasury_transactions(treasury)
-    assert calls == 2 and len(rows) == 2
+        with pytest.raises(IncompletePaginationError, match="incomplete pagination"):
+            await c.list_treasury_transactions(treasury)
+    assert calls == 2
+
+    # a page that repeats only seen rows while offering a new cursor is the same failure
+    def repeats(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params.get("cursor")
+        return httpx.Response(200, json={"transactions": [{"id": "same"}], "cursor": (int(cursor) if cursor else 0) + 1})
+
+    c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(repeats), sleep=_no_sleep)
+    async with c:
+        with pytest.raises(IncompletePaginationError):
+            await c.list_treasury_transactions(treasury)
+
+    # a non-integer non-null cursor cannot be followed either
+    def bad_cursor(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"transactions": [{"id": "x"}], "cursor": "later"})
+
+    c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(bad_cursor), sleep=_no_sleep)
+    async with c:
+        with pytest.raises(IncompletePaginationError):
+            await c.list_treasury_transactions(treasury)
 
     # exhausting MAX_PAGES with more remaining is an error
     monkeypatch.setattr(client_mod, "MAX_PAGES", 2)
@@ -478,14 +536,19 @@ async def test_treasury_transactions_int_cursor_stop_and_guards(fake_api, monkey
         assert len(rows) == 2
 
 
-async def test_paginate_stop_at_drops_the_matching_item_and_everything_after(fake_api, monkeypatch):
+async def test_list_events_offers_no_early_stop(fake_api, monkeypatch):
+    """M5: the client walks the whole feed for a window; there is no stop predicate to get it wrong."""
+    import inspect
+
     import mercury_multiorg_mcp.client as client_mod
 
+    assert "stop_at" not in inspect.signature(MercuryClient.list_events).parameters
+    assert "stop_at" not in inspect.signature(MercuryClient.list_treasury_transactions).parameters
     monkeypatch.setattr(client_mod, "MAX_PAGE_SIZE", 2)
     async with _client(fake_api) as c:
-        rows = await c.list_events(order="desc", stop_at=lambda e: e["occurredAt"] < "2026-03-03")
-    assert [r["id"][-1] for r in rows] == ["6", "5", "4", "3"]
-    assert len(fake_api.requests) == 3  # pages [6,5], [4,3], [2,1] -> stop at 2; nothing after it is fetched
+        rows = await c.list_events(order="desc")
+    assert [r["id"][-1] for r in rows] == ["6", "5", "4", "3", "2", "1"]
+    assert len(fake_api.requests) == 3
 
 
 async def test_phase3_client_methods_validate_ids_before_any_request(fake_api):
@@ -500,7 +563,7 @@ async def test_phase3_client_methods_validate_ids_before_any_request(fake_api):
             lambda: c.get_invoice_pdf("x/pdf"),
             lambda: c.list_invoice_attachments("#"),
         ):
-            with pytest.raises(ValueError, match="must be an id"):
+            with pytest.raises(ValueError, match="invalid id format"):
                 await call()
     assert fake_api.requests == []
 
@@ -522,7 +585,7 @@ async def test_unexpected_shapes_are_clean_errors(fake_api):
 async def test_invalid_url_from_httpx_is_a_clean_error(fake_api):
     """An id that passes nowhere near validate_path_id (internal misuse) still cannot escape as a raw httpx error."""
     async with _client(fake_api) as c:
-        with pytest.raises(MercuryAPIError, match="HTTP error calling GET"):
+        with pytest.raises(MercuryAPIError, match=r"HTTP error calling GET /cards/\{id\} \(InvalidURL\)"):
             await c._get("/cards/abc\n")
     assert fake_api.requests == []
 
@@ -541,9 +604,14 @@ async def test_treasury_int_cursor_walk_dedupes_overlapping_pages():
     assert [r["id"] for r in rows] == ["t1", "t2", "t3"]
 
 
-async def test_error_body_unreadable_on_streamed_response_is_wrapped():
+async def test_error_body_on_streamed_response_is_never_read():
+    """M1/M4: an error status closes the stream without reading it; its body cannot leak or expand."""
+    yielded = 0
+
     class Boom(httpx.AsyncByteStream):
         async def __aiter__(self):
+            nonlocal yielded
+            yielded += 1
             raise httpx.ReadError("gone")
             yield b""  # pragma: no cover
 
@@ -552,9 +620,9 @@ async def test_error_body_unreadable_on_streamed_response_is_wrapped():
 
     c = MercuryClient(FAKE_TOKEN_MAIN, api_base=FAKE_API_BASE, transport=httpx.MockTransport(handler), sleep=_no_sleep)
     async with c:
-        with pytest.raises(MercuryAPIError, match="HTTP 403 .* body unreadable") as info:
+        with pytest.raises(MercuryAPIError, match="HTTP 403") as info:
             await c.get_statement_pdf("66666666-0001-4666-8666-666666666666")
-    assert info.value.status_code == 403
+    assert info.value.status_code == 403 and yielded == 0
 
 
 def test_api_base_rejects_credentials_without_echoing_them():
@@ -572,7 +640,7 @@ def test_api_base_rejects_credentials_without_echoing_them():
         assert "hunter2" not in str(info.value)
 
 
-async def test_error_body_on_streamed_response_is_read_to_the_cap_only():
+async def test_error_body_on_big_streamed_response_is_not_read_at_all():
     import mercury_multiorg_mcp.client as client_mod
 
     yielded = 0
@@ -591,8 +659,9 @@ async def test_error_body_on_streamed_response_is_read_to_the_cap_only():
     async with c:
         with pytest.raises(MercuryAPIError) as info:
             await c.get_statement_pdf("66666666-0001-4666-8666-666666666666")
-    assert yielded <= client_mod.ERROR_BODY_CAP // 1024 + 1
-    assert len(str(info.value)) < 700 and "HTTP 500" in str(info.value)
+    assert yielded == 0  # not a single chunk of an error body is read any more
+    assert str(info.value) == "Mercury returned HTTP 500 for GET /statements/{id}/pdf"
+    assert not hasattr(client_mod, "ERROR_BODY_CAP")
 
 
 async def test_treasury_cursor_guard_is_non_advancing_only():

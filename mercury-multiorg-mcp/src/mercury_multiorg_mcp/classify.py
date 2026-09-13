@@ -82,6 +82,7 @@ name prefix test; counterparty text itself remains data.
 
 from __future__ import annotations
 
+import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -89,11 +90,39 @@ from typing import Any
 
 SETTLED_STATUSES = frozenset({"sent"})
 
+# Largest threshold accepted (USD). Anything above it is a caller mistake, and
+# values around 1e30 cannot be quantized to cents at all (m2).
+MAX_THRESHOLD = 1_000_000_000
+
+
 # Federal 1099-NEC/MISC reporting threshold by tax year: 600 through 2025,
 # 2000 from 2026, inflation-indexed from 2027 (pass the current figure).
 def default_threshold(year: int) -> float:
     """Default flag threshold for a tax year."""
     return 600.0 if year <= 2025 else 2000.0
+
+
+def validate_threshold(value: Any) -> Decimal:
+    """Return ``value`` in exact cents, or raise ``ValueError`` with a fixed message.
+
+    Rejects non-numbers, booleans, NaN and infinities, negatives, and
+    anything above ``MAX_THRESHOLD``. A threshold that cannot be represented
+    is an error, never silently zero.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        raise ValueError("threshold must be a number")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("threshold must be a finite number")
+    if isinstance(value, Decimal) and not value.is_finite():
+        raise ValueError("threshold must be a finite number")
+    if value < 0:
+        raise ValueError("threshold must not be negative")
+    if value > MAX_THRESHOLD:
+        raise ValueError(f"threshold must not exceed {MAX_THRESHOLD:,}")
+    cents = to_cents(value)
+    if cents is None:
+        raise ValueError("threshold is not representable in cents")
+    return cents
 
 
 # kind -> (method label or None to read details, reason). Labels key `by_method`.
@@ -300,7 +329,7 @@ def summarize(
     transaction's ``counterpartyId`` matches a known recipient.
     """
     recipients_by_id = recipients_by_id or {}
-    threshold_cents = to_cents(threshold) or _ZERO
+    threshold_cents = validate_threshold(threshold)
 
     groups: dict[tuple[str, str], dict[str, Any]] = {}
     review: dict[str, dict[tuple[str, str], dict[str, Any]]] = {bucket: {} for bucket in BUCKET_HINTS}

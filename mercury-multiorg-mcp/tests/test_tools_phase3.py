@@ -122,6 +122,7 @@ async def test_get_statement_pdf_returns_embedded_blob(mcp_client: Client, fake_
         "mimeType": "application/pdf",
         "bytes": len(FAKE_PDF),
         "encoding": "base64 in the embedded resource that follows",
+        "redacted": False,  # M3: documents are verbatim and say so
     }
     assert isinstance(blob_block, EmbeddedResource)
     resource = blob_block.resource
@@ -135,11 +136,11 @@ async def test_get_statement_pdf_errors(mcp_client: Client, fake_api: FakeMercur
     # unknown id -> 404 surfaced cleanly
     res = await mcp_client.call_tool("get_statement_pdf", {"entity": "acme_main", "statement_id": "66666666-0009-4666-8666-666666666666"})
     assert "404" in _error_text(res)
-    # not a PDF
+    # not a PDF: wrong content type is refused before the body is read, and never echoed (M1, M3)
     fake_api.pdf_bytes, fake_api.pdf_content_type = b"<html>nope</html>", "text/html"
     res = await mcp_client.call_tool("get_statement_pdf", {"entity": "acme_main", "statement_id": STATEMENT_1})
     text = _error_text(res)
-    assert "not a PDF" in text and "text/html" in text
+    assert "did not return a PDF (unexpected content type)" in text and "text/html" not in text and "nope" not in text
     # declared size above the cap: refused before the body is read
     monkeypatch.setattr(server_mod, "MAX_DOWNLOAD_BYTES", 64)
     fake_api.pdf_bytes, fake_api.pdf_content_type = b"%PDF-1.4\n" + b"x" * 200, "application/pdf"
@@ -149,10 +150,11 @@ async def test_get_statement_pdf_errors(mcp_client: Client, fake_api: FakeMercur
     fake_api.pdf_send_content_length = False
     res = await mcp_client.call_tool("get_statement_pdf", {"entity": "acme_main", "statement_id": STATEMENT_1})
     assert "exceeded the 64-byte limit" in _error_text(res)
-    # path traversal in the id never reaches the wire
+    # path traversal in the id never reaches the wire, and the id is not echoed
     before = len(fake_api.requests)
     res = await mcp_client.call_tool("get_statement_pdf", {"entity": "acme_main", "statement_id": "../accounts"})
-    assert "statement_id must be an id" in _error_text(res)
+    text = _error_text(res)
+    assert "statement_id: invalid id format" in text and "../accounts" not in text
     assert len(fake_api.requests) == before
 
 
@@ -196,12 +198,13 @@ async def test_list_treasury_transactions_date_window_is_client_side(mcp_client:
     assert [r["canonicalDay"] for r in data["transactions"]] == ["2026-03-15", "2026-03-01", "2026-02-15", "2026-02-01"]
     assert data["truncated"] is False and data["filters"]["start"] == "2026-02-01"
     reqs = [r for r in fake_api.requests if "/transactions" in r.url.path]
-    # the walk stopped as soon as a row older than `start` appeared (page 2 holds 2026-01-15), never fetching page 3
-    assert len(reqs) == 2
+    # M5: with a window the whole ledger is walked (7 rows, pages of 3), filtered and sorted here
+    assert len(reqs) == 3
     assert all("start" not in r.url.params and "end" not in r.url.params for r in reqs)  # the API has no date filters
 
     res = await mcp_client.call_tool("list_treasury_transactions", {"entity": "acme_main", "treasury_id": KNOWN_TREASURY_ID, "start": "March 2026"})
-    assert "start must be YYYY-MM-DD" in _error_text(res)
+    text = _error_text(res)
+    assert "start must be YYYY-MM-DD" in text and "March 2026" not in text
     res = await mcp_client.call_tool("list_treasury_transactions", {"entity": "acme_main", "treasury_id": "33333333-0000-4333-8333-333333333333"})
     assert "404" in _error_text(res)
 
@@ -263,7 +266,8 @@ async def test_get_card(mcp_client: Client, fake_api: FakeMercury):
     res = await mcp_client.call_tool("get_card", {"entity": "acme_main", "card_id": "dddddddd-0009-4ddd-8ddd-dddddddddddd"})
     assert "404" in _error_text(res)
     res = await mcp_client.call_tool("get_card", {"entity": "acme_main", "card_id": "x/../../cards"})
-    assert "card_id must be an id" in _error_text(res)
+    text = _error_text(res)
+    assert "card_id: invalid id format" in text and "x/../../cards" not in text
     assert all(r.url.path in {f"/api/v1/cards/{CARD_1}", "/api/v1/cards/dddddddd-0009-4ddd-8ddd-dddddddddddd"} for r in fake_api.requests)
 
 
@@ -319,7 +323,8 @@ async def test_list_invoices_projection_and_client_side_filters(mcp_client: Clie
     assert data["filters"] == {"status": None, "start": "2026-01-01", "end": "2026-02-28", "limit": 1}
 
     res = await mcp_client.call_tool("list_invoices", {"entity": "acme_main", "end": "2026/02/28"})
-    assert "end must be YYYY-MM-DD" in _error_text(res)
+    text = _error_text(res)
+    assert "end must be YYYY-MM-DD" in text and "2026/02/28" not in text
 
 
 async def test_get_invoice_with_line_items(mcp_client: Client, fake_api: FakeMercury):
@@ -377,7 +382,7 @@ async def test_list_users(mcp_client: Client, fake_api: FakeMercury):
 
 async def test_list_events_reprojects_patches_through_resource_allowlists(mcp_client: Client, fake_api: FakeMercury):
     data = await _ok(mcp_client, "list_events", {"entity": "acme_main"})
-    assert data["count"] == 6 and data["truncated"] is False and data["order_verified"] is True
+    assert data["count"] == 6 and data["truncated"] is False and "order_verified" not in data
     events = {e["id"][-1]: e for e in data["events"]}
     assert [e["id"][-1] for e in data["events"]] == ["6", "5", "4", "3", "2", "1"]  # newest first
     # the documented balance-update field survives on account events (event-only allowlist), account number masked
@@ -413,9 +418,9 @@ async def test_list_events_since_and_resource_type(mcp_client: Client, fake_api:
     monkeypatch.setattr(client_mod, "MAX_PAGE_SIZE", 2)
     data = await _ok(mcp_client, "list_events", {"entity": "acme_main", "since": "2026-03-03"})
     assert [e["id"][-1] for e in data["events"]] == ["6", "5", "4", "3"]  # 2026-03-03T00:00 is included (>=)
-    assert data["order_verified"] is True
+    assert "order_verified" not in data
     reqs = [r for r in fake_api.requests if r.url.path == "/api/v1/events"]
-    assert len(reqs) == 3  # pages of 2 newest-first: [6,5], [4,3], [2,1] -> the stop fires on 2; nothing beyond is fetched
+    assert len(reqs) == 3  # M5: the whole feed is walked (6 rows, pages of 2), then filtered and sorted here
     assert all("since" not in r.url.params for r in reqs)  # the API has no time filter
 
     data = await _ok(mcp_client, "list_events", {"entity": "acme_main", "since": "2026-03-02T08:30:00Z", "resource_type": "transaction", "limit": 1})
@@ -423,55 +428,48 @@ async def test_list_events_since_and_resource_type(mcp_client: Client, fake_api:
     assert fake_api.requests[-1].url.params["resourceType"] == "transaction"
 
     res = await mcp_client.call_tool("list_events", {"entity": "acme_main", "since": "yesterday"})
-    assert "since must be YYYY-MM-DD" in _error_text(res)
+    text = _error_text(res)
+    assert "since must be YYYY-MM-DD" in text and "yesterday" not in text
 
 
-async def test_list_webhooks_returns_origin_and_fingerprint_only(mcp_client: Client, fake_api: FakeMercury):
+async def test_list_webhooks_returns_url_fingerprint_only(mcp_client: Client, fake_api: FakeMercury):
+    """M2: the receiver URL is dropped entirely (its hostname can be the capability); only a fingerprint remains."""
     import hashlib
 
     data = await _ok(mcp_client, "list_webhooks", {"entity": "acme_main"})
     assert data["count"] == 4
     hooks = data["webhooks"]
-    assert set(hooks[0]) == set(_WEBHOOK_FIELDS) | {"enabled", "path_fingerprint"}
-    # Slack: token lives in the path -> origin only, path fingerprinted
-    assert hooks[0]["url"] == "https://hooks.slack.com"
-    assert hooks[0]["path_fingerprint"] == hashlib.sha256(b"/services/T000/B000/fakeslacktoken").hexdigest()[:8]
+    assert set(hooks[0]) == set(_WEBHOOK_FIELDS) | {"enabled", "url_fingerprint"}
+    assert "url" not in _WEBHOOK_FIELDS and all("url" not in h and "path_fingerprint" not in h for h in hooks)
+    raw = load_fixture("webhooks.json")["webhooks"]
+    for hook, source in zip(hooks, raw, strict=True):
+        assert hook["url_fingerprint"] == hashlib.sha256(source["url"].encode()).hexdigest()[:8]
+        assert re.fullmatch(r"[0-9a-f]{8}", hook["url_fingerprint"])
+    assert len({h["url_fingerprint"] for h in hooks}) == 4  # distinguishable
     assert hooks[0]["status"] == "active" and hooks[0]["enabled"] is True
     assert hooks[0]["eventTypes"] == ["transaction.created", "transaction.updated"] and hooks[0]["filterPaths"] == ["transaction.status"]
-    # Discord: token in the path, query string too
-    assert hooks[1]["url"] == "https://discord.com" and hooks[1]["enabled"] is False and hooks[1]["eventTypes"] is None
-    # userinfo, non-default port, fragment
-    assert hooks[2]["url"] == "https://hooks.example:8443" and hooks[2]["enabled"] is False
-    # IPv6 literal keeps its brackets
-    assert hooks[3]["url"] == "https://[2001:db8::1]:8443"
-    assert hooks[3]["path_fingerprint"] == hashlib.sha256(b"/catch/xyz").hexdigest()[:8]
-    # two hooks on one host stay distinguishable through the fingerprint
-    assert hooks[2]["path_fingerprint"] != hooks[3]["path_fingerprint"]
-    assert all(re.fullmatch(r"[0-9a-f]{8}", h["path_fingerprint"]) for h in hooks)
+    assert hooks[1]["enabled"] is False and hooks[1]["eventTypes"] is None
     _never(
         json.dumps(data),
         "secret", "whsec_",
-        "/services/", "T000", "B000", "fakeslacktoken",
-        "/api/webhooks", "fakediscordtoken", "wait=true",
-        "fakepass", "user:", "/catch/", "#frag", "xyz",
+        "hooks.slack.com", "/services/", "T000", "B000", "fakeslacktoken",
+        "discord.com", "/api/webhooks", "fakediscordtoken", "wait=true",
+        "hooks.example", "fakepass", "user:", "/catch/", "#frag", "xyz",
+        "2001:db8", "https://",
     )
 
 
-def test_url_origin_and_path_fingerprint_edge_cases():
+def test_url_fingerprint_edge_cases():
     import hashlib
 
-    from mercury_multiorg_mcp.projections import _url_origin_and_path_fingerprint as f
+    from mercury_multiorg_mcp.projections import project_webhook, url_fingerprint
 
-    assert f("https://h.example/p?x=1#f") == ("https://h.example", hashlib.sha256(b"/p").hexdigest()[:8])
-    assert f("https://u:p@h.example/p") == ("https://h.example", hashlib.sha256(b"/p").hexdigest()[:8])
-    assert f("https://h.example") == ("https://h.example", hashlib.sha256(b"").hexdigest()[:8])
-    assert f("https://[::1]/x") == ("https://[::1]", hashlib.sha256(b"/x").hexdigest()[:8])
-    assert f("https://[::1]:9/x")[0] == "https://[::1]:9"
-    assert f("https://h.example:notaport/x") == (None, None)  # non-numeric port: ValueError inside the try
-    assert f("https://[::1") == (None, None)  # unparseable
-    assert f("not a url") == (None, None)  # no host
-    assert f(None) == (None, None)
-    assert f(42) == (None, None)
+    assert url_fingerprint("https://h.example/p?x=1#f") == hashlib.sha256(b"https://h.example/p?x=1#f").hexdigest()[:8]
+    assert url_fingerprint("https://h.example/p") != url_fingerprint("https://h.example/q")  # the whole URL is hashed
+    assert url_fingerprint("") is None and url_fingerprint(None) is None and url_fingerprint(42) is None
+    assert project_webhook({"id": "w", "url": 42, "status": "paused"}) == {
+        "id": "w", "status": "paused", "url_fingerprint": None, "enabled": False,
+    }
 
 
 # -- cross-cutting ----------------------------------------------------------------
@@ -547,7 +545,8 @@ async def test_phase3_tools_require_entity_and_report_missing_token(mcp_client: 
         text = _error_text(res)
         assert "acme_ops" in text and "MERCURY_TOKEN_ACME_OPS" in text and "Traceback" not in text, tool
         res = await mcp_client.call_tool(tool, {"entity": "acme_other", **args})
-        assert "acme_other" in _error_text(res), tool
+        text = _error_text(res)
+        assert "Unknown entity" in text and "acme_other" not in text, tool  # M1: caller input is never echoed
     assert fake_api.requests == []
 
 
@@ -558,6 +557,7 @@ async def test_phase3_tools_surface_api_failures_cleanly(mcp_client: Client, fak
         res = await mcp_client.call_tool(tool, {"entity": "acme_main", **args})
         text = _error_text(res)
         assert "[acme_main]" in text and "500" in text and "Traceback" not in text and FAKE_TOKEN_MAIN not in text, tool
+        assert "internal:" not in text and "[REDACTED]" not in text, tool  # M1: the body is never quoted
 
 
 @pytest.mark.parametrize(
@@ -624,23 +624,22 @@ async def test_list_events_since_accepts_offset_form_and_stops_after_enough_rows
     data = await _ok(mcp_client, "list_events", {"entity": "acme_main", "since": "2026-03-01T00:00:00+00:00", "limit": 2})
     assert [e["id"][-1] for e in data["events"]] == ["6", "5"] and data["truncated"] is True
     reqs = [r for r in fake_api.requests if r.url.path == "/api/v1/events"]
-    assert len(reqs) == 4  # pages of 1: 6, 5, 4 (limit+1 in hand), then the 4th row triggers the stop; 5th never fetched
+    assert len(reqs) == 6  # M5: pages of 1, the whole feed; `truncated` counts every in-window row
 
 
-async def test_treasury_end_only_window_stops_early(mcp_client: Client, fake_api: FakeMercury, monkeypatch):
+async def test_treasury_end_only_window_walks_the_whole_ledger(mcp_client: Client, fake_api: FakeMercury, monkeypatch):
     import mercury_multiorg_mcp.client as client_mod
 
     monkeypatch.setattr(client_mod, "MAX_PAGE_SIZE", 2)
     data = await _ok(mcp_client, "list_treasury_transactions", {"entity": "acme_main", "treasury_id": KNOWN_TREASURY_ID, "end": "2026-03-15", "limit": 1})
     assert [r["canonicalDay"] for r in data["transactions"]] == ["2026-03-15"] and data["truncated"] is True
     reqs = [r for r in fake_api.requests if "/transactions" in r.url.path]
-    # pages of 2 newest-first: [03-31, 03-15], [03-01, 02-15] -> two in-window rows in hand after row 3; stop at row 4
-    assert len(reqs) == 2
+    assert len(reqs) == 4  # M5: 7 rows in pages of 2, all fetched; no early stop
 
 
 async def test_trailing_newline_ids_and_days_are_rejected_cleanly(mcp_client: Client, fake_api: FakeMercury):
     res = await mcp_client.call_tool("get_card", {"entity": "acme_main", "card_id": CARD_1 + "\n"})
-    assert "card_id must be an id" in _error_text(res)
+    assert "card_id: invalid id format" in _error_text(res)
     res = await mcp_client.call_tool("list_invoices", {"entity": "acme_main", "start": "2026-01-01\n"})
     assert "start must be YYYY-MM-DD" in _error_text(res)
     assert fake_api.requests == []
@@ -657,14 +656,15 @@ async def test_transport_error_mid_stream_is_a_clean_redacted_error(mcp_client: 
     monkeypatch.setattr(fake_api, "_pdf_response", lambda: httpx.Response(200, stream=Boom(), headers={"Content-Type": "application/pdf"}))
     res = await mcp_client.call_tool("get_statement_pdf", {"entity": "acme_main", "statement_id": STATEMENT_1})
     text = _error_text(res)
-    assert "[acme_main]" in text and "Transport error while downloading" in text and "after 9 bytes" in text
-    assert FAKE_TOKEN_MAIN not in text and "[REDACTED]" in text and "Traceback" not in text
+    assert text.endswith("[acme_main] Transport error while reading GET /statements/{id}/pdf after 9 bytes (ReadError)")
+    assert FAKE_TOKEN_MAIN not in text and "reset" not in text and "[REDACTED]" not in text and "Traceback" not in text
 
 
 # -- Phase 4 ----------------------------------------------------------------------
 
 
-async def test_list_events_non_monotonic_order_disables_early_stop(mcp_client: Client, fake_api: FakeMercury, monkeypatch):
+async def test_list_events_out_of_order_feed_is_walked_in_full_and_sorted(mcp_client: Client, fake_api: FakeMercury, monkeypatch):
+    """M5: an out-of-order page can no longer drop in-window rows; the result is sorted newest first."""
     import mercury_multiorg_mcp.client as client_mod
 
     monkeypatch.setattr(client_mod, "MAX_PAGE_SIZE", 2)
@@ -673,15 +673,18 @@ async def test_list_events_non_monotonic_order_disables_early_stop(mcp_client: C
     def ev(n, ts):
         return {**base, "id": f"e0000000-000{n}-4e00-8e00-e0000000000{n}", "occurredAt": ts, "resourceType": "transaction", "mergePatch": {}, "previousValues": None, "changedPaths": []}
 
-    # served newest-first by the fake (it reverses the natural asc order), except one row out of place:
     # desc stream = [7 (03-07), 6 (03-06)], [2 (03-02) <- older than since, 5 (03-05) <- newer than the row before it], [4, 3]
     fake_api.rows["/api/v1/events"] = [ev(3, "2026-03-03T00:00:00Z"), ev(4, "2026-03-04T00:00:00Z"), ev(5, "2026-03-05T00:00:00Z"), ev(2, "2026-03-02T00:00:00Z"), ev(6, "2026-03-06T00:00:00Z"), ev(7, "2026-03-07T00:00:00Z")]
     data = await _ok(mcp_client, "list_events", {"entity": "acme_main", "since": "2026-03-03"})
-    assert data["order_verified"] is False
-    # nothing in the window was lost: 7, 6, 5, 4, 3 all present, 2 excluded
-    assert sorted(e["id"][-1] for e in data["events"]) == ["3", "4", "5", "6", "7"]
+    assert "order_verified" not in data
+    # nothing in the window was lost and the order is by occurredAt, newest first: 7, 6, 5, 4, 3; 2 excluded
+    assert [e["id"][-1] for e in data["events"]] == ["7", "6", "5", "4", "3"]
+    assert data["count"] == 5 and data["truncated"] is False
     reqs = [r for r in fake_api.requests if r.url.path == "/api/v1/events"]
     assert len(reqs) == 3  # the full feed was walked
+    # with a limit, truncated reflects every in-window row, not just the ones seen before an inversion
+    data = await _ok(mcp_client, "list_events", {"entity": "acme_main", "since": "2026-03-03", "limit": 2})
+    assert [e["id"][-1] for e in data["events"]] == ["7", "6"] and data["truncated"] is True
 
 
 async def test_list_events_unparseable_occurred_at_is_dropped_under_since(mcp_client: Client, fake_api: FakeMercury):
@@ -690,7 +693,7 @@ async def test_list_events_unparseable_occurred_at_is_dropped_under_since(mcp_cl
             {**base, "id": "e0000000-0002-4e00-8e00-e00000000002", "occurredAt": "garbage"}]
     fake_api.rows["/api/v1/events"] = rows
     data = await _ok(mcp_client, "list_events", {"entity": "acme_main", "since": "2026-03-01"})
-    assert [e["id"][-1] for e in data["events"]] == ["1"] and data["order_verified"] is True
+    assert [e["id"][-1] for e in data["events"]] == ["1"]
     data = await _ok(mcp_client, "list_events", {"entity": "acme_main"})
     assert data["count"] == 2  # without since nothing is dropped
 
@@ -708,7 +711,8 @@ async def test_invoice_pdf_falls_back_to_slug_without_ever_returning_it(mcp_clie
     fake_api.invoice_pdf_slug_status = 403
     res = await mcp_client.call_tool("get_invoice_pdf", {"entity": "acme_main", "invoice_id": INVOICE_1})
     text = _error_text(res)
-    assert "403" in text and INVOICE_1 in text and "tried by slug" in text and "pub-slug" not in text
+    assert "403" in text and "GET /ar/invoices/{id}/pdf" in text and "slug path was tried" in text
+    assert "pub-slug" not in text and INVOICE_1 not in text  # neither the slug nor the caller's id is echoed
 
 
 async def test_list_statements_span_and_date_validation(mcp_client: Client, fake_api: FakeMercury):
@@ -717,7 +721,8 @@ async def test_list_statements_span_and_date_validation(mcp_client: Client, fake
     assert ok["filters"]["start"] == "2025-11-30"
     res = await mcp_client.call_tool("list_statements", {**base, "start": "2025-11-30", "end": "2026-03-01"})
     text = _error_text(res)
-    assert "3 months" in text and "Mercury" in text and "2026-02-28" in text
+    assert "3 months" in text and "Mercury" in text and "2026-02-28" in text  # the derived limit, not the input
+    assert "2026-03-01" not in text and "2025-11-30" not in text
     res = await mcp_client.call_tool("list_statements", {**base, "start": "2026-02-30"})
     assert "real calendar date" in _error_text(res)
     res = await mcp_client.call_tool("list_statements", {**base, "start": "March 2026"})
@@ -732,7 +737,7 @@ async def test_list_invoices_status_is_case_insensitive_and_validated(mcp_client
     assert data["filters"]["status"] == "Unpaid" and [i["invoiceNumber"] for i in data["invoices"]] == ["INV-101", "INV-104"]
     res = await mcp_client.call_tool("list_invoices", {"entity": "acme_main", "status": "Overdue"})
     text = _error_text(res)
-    assert "Unpaid, Paid, Cancelled, Processing" in text and "Overdue" in text
+    assert "Unpaid, Paid, Cancelled, Processing" in text and "Overdue" not in text  # M1: never echoed
 
 
 async def test_invalid_enum_arguments_surface_the_api_error(mcp_client: Client, fake_api: FakeMercury):
@@ -757,9 +762,10 @@ def test_projection_edge_cases():
     assert project_statement({"id": "s", "transactions": None})["transactionCount"] is None
 
 
-# Nested pass-through objects, pinned to the live schema so drift fails review.
+# Nested objects: each has its own allowlist (m1), pinned here to the live key sets so a drift in either direction
+# (a key Mercury adds, or one this package stops projecting) fails review. Fixtures carry every live key.
 _NESTED_SHAPES: dict[str, tuple[str, str, set[str]]] = {
-    # name: (fixture, json path, exact key set from the live OpenAPI, 2026-09-12)
+    # name: (fixture, json path, exact key set from the live OpenAPI, re-fetched 2026-09-13)
     "transaction.merchant (MerchantData)": ("transactions_page1.json", "transactions[].merchant", {"amount", "category", "categoryCode", "currency", "id"}),
     "transaction.categoryData (CategoryData)": ("transactions_page1.json", "transactions[].categoryData", {"id", "name", "visibleForCardSpend", "visibleForOther", "visibleForReimbursements"}),
     "transaction.currencyExchangeInfo": ("transactions_1099_2026.json", "transactions[].currencyExchangeInfo", {"convertedFromAmount", "convertedFromCurrency", "convertedToAmount", "convertedToCurrency", "exchangeRate", "feeAmount", "feePercentage", "feeTransactionId"}),
@@ -786,9 +792,25 @@ def _walk(obj, path):
         yield from _walk(obj.get(head), rest)
 
 
+_NESTED_ALLOWLISTS = {
+    "transaction.merchant (MerchantData)": _TRANSACTION_FIELDS["merchant"],
+    "transaction.categoryData (CategoryData)": _TRANSACTION_FIELDS["categoryData"],
+    "transaction.currencyExchangeInfo": _TRANSACTION_FIELDS["currencyExchangeInfo"],
+    "organization.dbas[] (OrganizationDBA)": _ORGANIZATION_FIELDS["dbas"][0],
+    "treasury.netReturns[] (TreasuryNetReturn)": _TREASURY_ACCOUNT_FIELDS["netReturns"][0],
+    "treasury.netReturns[].dividends[] (TreasuryDividend)": _TREASURY_ACCOUNT_FIELDS["netReturns"][0]["dividends"][0],
+    "treasury transaction.details (TreasuryTransactionDetails)": _TREASURY_TRANSACTION_FIELDS["details"],
+    "card.spendLimit (SpendLimit)": _CARD_FIELDS["spendLimit"],
+    "card.budgets[] (CardBudget)": _CARD_FIELDS["budgets"][0],
+    "card.merchantLock (MerchantInfo)": _CARD_FIELDS["merchantLock"],
+    "invoice.lineItems[] (ApiV1ArLineItemData)": _INVOICE_DETAIL_FIELDS["lineItems"][0],
+}
+
+
 @pytest.mark.parametrize("label", sorted(_NESTED_SHAPES))
-def test_nested_pass_through_objects_match_the_live_schema(label):
+def test_nested_allowlists_match_the_live_schema_and_the_fixtures(label):
     fixture, path, keys = _NESTED_SHAPES[label]
+    assert set(_NESTED_ALLOWLISTS[label]) == keys, label  # the nested allowlist is exactly the live key set
     found = [o for o in _walk(load_fixture(fixture), path.split(".")) if o is not None]
     assert found, f"{label}: no non-null instance in {fixture}; the pin would be vacuous"
     for obj in found:

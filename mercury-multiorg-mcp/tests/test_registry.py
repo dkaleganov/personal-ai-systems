@@ -21,24 +21,28 @@ def test_example_registry_loads():
 )
 def test_key_shape_is_validated(bad_key):
     with pytest.raises(RegistryError, match=r"entities\[0\]"):
-        Registry.from_mapping({"entities": [{"key": bad_key, "display_name": "x", "token_env": "T_X"}]})
+        Registry.from_mapping({"entities": [{"key": bad_key, "display_name": "x", "token_env": "MERCURY_TOKEN_X"}]})
 
 
-@pytest.mark.parametrize("bad_env", ["lower", "1ABC", "HAS-DASH", ""])
+@pytest.mark.parametrize(
+    "bad_env",
+    ["lower", "1ABC", "HAS-DASH", "", "MERCURY_TOKEN_", "mercury_token_x", "OTHER_SECRET", "AWS_SECRET_ACCESS_KEY", "MERCURY_TOKENX"],
+)
 def test_token_env_shape_is_validated(bad_env):
-    with pytest.raises(RegistryError, match="token_env"):
+    """token_env must live under the reserved MERCURY_TOKEN_ prefix (hardening: a registry cannot name any env var)."""
+    with pytest.raises(RegistryError, match="token_env.*MERCURY_TOKEN_"):
         Registry.from_mapping({"entities": [{"key": "acme", "display_name": "x", "token_env": bad_env}]})
 
 
 def test_blank_display_name_rejected():
     with pytest.raises(RegistryError, match="display_name"):
-        Registry.from_mapping({"entities": [{"key": "acme", "display_name": "   ", "token_env": "T_X"}]})
+        Registry.from_mapping({"entities": [{"key": "acme", "display_name": "   ", "token_env": "MERCURY_TOKEN_X"}]})
 
 
 def test_extra_fields_rejected():
     with pytest.raises(RegistryError, match="token"):
         Registry.from_mapping(
-            {"entities": [{"key": "acme", "display_name": "x", "token_env": "T_X", "token": "leak"}]}
+            {"entities": [{"key": "acme", "display_name": "x", "token_env": "MERCURY_TOKEN_X", "token": "leak"}]}
         )
 
 
@@ -47,8 +51,8 @@ def test_duplicate_keys_rejected():
         Registry.from_mapping(
             {
                 "entities": [
-                    {"key": "acme", "display_name": "a", "token_env": "T_A"},
-                    {"key": "acme", "display_name": "b", "token_env": "T_B"},
+                    {"key": "acme", "display_name": "a", "token_env": "MERCURY_TOKEN_A"},
+                    {"key": "acme", "display_name": "b", "token_env": "MERCURY_TOKEN_B"},
                 ]
             }
         )
@@ -67,7 +71,7 @@ def test_bad_root_shapes_rejected(data):
 
 def test_unknown_top_level_keys_rejected():
     with pytest.raises(RegistryError, match="Unexpected top-level"):
-        Registry.from_mapping({"entities": [{"key": "a", "display_name": "a", "token_env": "T"}], "tokens": {}})
+        Registry.from_mapping({"entities": [{"key": "a", "display_name": "a", "token_env": "MERCURY_TOKEN_A"}], "tokens": {}})
 
 
 def test_missing_file(tmp_path):

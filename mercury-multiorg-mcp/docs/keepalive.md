@@ -26,7 +26,10 @@ uvx --from 'git+https://github.com/dkaleganov/personal-ai-systems@<FULL_COMMIT_S
 Same configuration conventions as the server: `--entities PATH` or
 `MERCURY_ENTITIES_FILE`, optional `--env-file PATH` (only then is a dotenv
 file read; existing env vars win), optional `--api-base URL` or
-`MERCURY_API_BASE` (`https://` only).
+`MERCURY_API_BASE` (production, `https://api-sandbox.mercury.com`, or a
+loopback mock; any other host needs `--allow-custom-api-base` on the
+command line). A configured token without the documented `secret-token:`
+prefix produces a warning line on stderr (last four characters only).
 
 ## Output
 
@@ -44,7 +47,7 @@ Exit status:
 | --- | --- |
 | 0 | every configured entity succeeded |
 | 1 | at least one entity failed, or no entity has a token configured at all |
-| 2 | configuration error (registry missing or invalid, bad API base) |
+| 2 | configuration error (registry missing, invalid, or unreadable; bad or disallowed API base); always one line on stderr, never a traceback |
 
 Alert on a nonzero exit or on any `FAIL` line: an HTTP 401 usually means
 the token was already deleted or the env var holds a stale value.

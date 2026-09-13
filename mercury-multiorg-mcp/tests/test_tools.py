@@ -34,6 +34,9 @@ PHASE3_TOOLS = {
     "list_webhooks",
 }
 EXPECTED_TOOLS = PHASE1_TOOLS | PHASE2_TOOLS | PHASE3_TOOLS
+# Registered only with --allow-documents / MERCURY_ALLOW_DOCUMENTS=1 (M3): documents are returned unredacted.
+DOCUMENT_TOOLS = {"get_statement_pdf", "get_invoice_pdf"}
+DEFAULT_TOOLS = EXPECTED_TOOLS - DOCUMENT_TOOLS
 # Every tool that touches Mercury takes `entity`; only the two registry-level tools do not.
 ENTITY_TOOLS = EXPECTED_TOOLS - {"list_entities", "server_info"}
 
@@ -190,10 +193,11 @@ async def test_missing_token_is_clean_per_entity_error(mcp_client: Client, fake_
     assert not ok.is_error
 
 
-async def test_unknown_entity_lists_known_keys(mcp_client: Client):
+async def test_unknown_entity_lists_known_keys_without_echoing_the_input(mcp_client: Client):
     res = await mcp_client.call_tool("list_accounts", {"entity": "acme_other"})
     text = _error_text(res)
-    assert "acme_other" in text and "acme_main" in text and "acme_ops" in text
+    assert "Unknown entity" in text and "acme_main" in text and "acme_ops" in text
+    assert "acme_other" not in text  # caller input is never echoed (M1)
 
 
 async def test_api_failure_is_prefixed_and_redacted(mcp_client: Client, fake_api):
@@ -204,6 +208,7 @@ async def test_api_failure_is_prefixed_and_redacted(mcp_client: Client, fake_api
     assert "[acme_main]" in text
     assert "500" in text
     assert FAKE_TOKEN_MAIN not in text
+    assert "internal:" not in text and "[REDACTED]" not in text  # the body is never quoted, so nothing to redact (M1)
 
 
 async def test_real_stdio_process_starts_with_example_registry(monkeypatch):
@@ -216,9 +221,10 @@ async def test_real_stdio_process_starts_with_example_registry(monkeypatch):
     )
     async with Client(params) as client:
         tools = await client.list_tools()
-        assert {t.name for t in tools.tools} == EXPECTED_TOOLS
+        assert {t.name for t in tools.tools} == DEFAULT_TOOLS  # 24: document tools are opt-in (M3)
         info = _payload(await client.call_tool("server_info", {}))
         assert info["entity_count"] == 2 and info["entities_with_token"] == 0
+        assert info["documents_enabled"] is False
         res = await client.call_tool("list_accounts", {"entity": "acme_main"})
         assert res.is_error
         assert "MERCURY_TOKEN_ACME_MAIN" in _error_text(res)

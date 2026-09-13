@@ -23,7 +23,7 @@ AI builder, photographer, and animator on the weekends.
 
 - **mercury-multiorg-mcp/** — A read-only MCP server over several Mercury
   banking organizations at once (the official connector binds one org
-  per connection): balances, transactions, statements and PDFs,
+  per connection): balances, transactions, statements (PDFs opt-in),
   treasury, cards, invoices, a 1099 pre-filing cross-check, and a
   keepalive CLI. Never a write endpoint, never a full account number.
 

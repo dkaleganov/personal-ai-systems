@@ -119,7 +119,9 @@ def test_transport_error_is_a_fail_line_without_token(clean_env, monkeypatch, ca
     lines, _ = _lines(capsys)
     assert len(lines) == 2
     for ln in lines:
-        assert " FAIL " in ln and "refused" in ln and "[REDACTED]" in ln and "\n" not in ln
+        # fixed text: the exception class, never its repr (which carried the request headers)
+        assert " FAIL " in ln and "ConnectError" in ln and "\n" not in ln
+        assert "refused" not in ln and "[REDACTED]" not in ln and "headers" not in ln
 
 
 def test_zero_tokens_configured_is_a_failure(clean_env, capsys, fake_api, factory):

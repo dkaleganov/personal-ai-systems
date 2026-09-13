@@ -53,9 +53,9 @@ Phase 1 — core:
   filtering uses the `accountId` filter on the same endpoint, not
   `GET /account/{id}/transactions` (offset-paginated, different envelope).
 - `server_info`: `name`, package `version`, `api_base`, `entity_count`,
-  `entities_with_token`, `transport` ("stdio"), `read_only` (true). No
-  secrets. Intended, so a client can verify which build and config it is
-  talking to.
+  `entities_with_token`, `transport` ("stdio"), `read_only` (true),
+  `documents_enabled` (v0.1.1). No secrets. Intended, so a client can
+  verify which build and config it is talking to.
 
 Identifier masking (decided Phase 1, applies to every phase): tool output
 is an explicit allowlist projection of the live schema, never the raw
@@ -63,7 +63,10 @@ object. `accountNumber` is returned only as `accountNumberLast4`;
 `routingNumber` and transaction `details` (counterparty routing/account
 numbers) are never returned. The allowlists in
 `src/mercury_multiorg_mcp/projections.py` enumerate every excluded
-live-schema field with a reason; extend them deliberately.
+live-schema field with a reason; extend them deliberately. Since v0.1.1
+the allowlist applies at every level: each nested object has its own
+sub-allowlist (spec language `S` scalar, `[S]`, `{...}`, `[{...}]`), an
+unknown nested key is dropped, and a shape mismatch becomes `null`.
 
 Phase 2 — 1099 support (built 2026-09-12):
 - `reportable_totals(entity, year, threshold=None)`: per-recipient payment
@@ -158,11 +161,17 @@ Phase 3 — holistic read surface (built 2026-09-12; full reference in
   number, address, download URL, or transaction list).
   `get_statement_pdf(entity, statement_id)`: `GET /statements/{id}/pdf`
   returned as an `EmbeddedResource` blob (application/pdf, base64), capped
-  at `MAX_DOWNLOAD_BYTES` (10 MB) by declared length and by a streaming
-  cap, never written to disk; non-PDF bodies are an error.
+  at `MAX_DOWNLOAD_BYTES` (10 MB of wire bytes) by declared length and by
+  a streaming cap, never written to disk. Since v0.1.1 the two PDF tools
+  are registered only with `--allow-documents` / `MERCURY_ALLOW_DOCUMENTS=1`
+  (24 tools by default, 26 with the flag) because documents are verbatim
+  and unredacted; the body must be `application/pdf` or
+  `application/octet-stream`, start with `%PDF-`, and carry `%%EOF` in its
+  last 2 KB, else a fixed error.
 - treasury: `list_treasury`, `list_treasury_transactions(entity,
-  treasury_id, start?, end?, limit)` (integer-cursor endpoint; date window
-  client-side on `canonicalDay` with an early stop), `list_treasury_statements
+  treasury_id, start?, end?, limit)` (integer-cursor endpoint; a date
+  window walks the whole ledger, filters on `canonicalDay`, sorts newest
+  first; no early stop since v0.1.1), `list_treasury_statements
   (entity, treasury_id, document_type?)` (metadata; `downloadUrl` omitted).
 - `list_credit_accounts`; `list_cards(entity, account_id?, status?, limit)`
   and `get_card` (no PAN/CVC from the API; `expiration` dropped here).
@@ -173,38 +182,53 @@ Phase 3 — holistic read surface (built 2026-09-12; full reference in
   `get_invoice_pdf` (blob pattern), `list_invoice_attachments` (id,
   fileName; no URL).
 - `list_users`; `list_events(entity, since?, resource_type?, limit)`
-  (no server time filter; `since` client-side newest-first with an early
-  stop; `mergePatch`/`previousValues` re-projected through the changed
-  resource's allowlist, omitted with `patchOmitted` for unknown types);
-  `list_webhooks` (config view; `secret` never returned; `url` reduced to
-  its origin `scheme://host[:port]` plus `path_fingerprint` = first 8 hex
-  chars of sha256(path), because receiver URLs carry the capability token
-  in the path (Slack, Discord, Zapier, Make, n8n), query, or userinfo;
-  `enabled` derived from `status`). Event patches for the five account
-  resource types additionally allow `inFlightBalance` (documented in the
-  webhook filterPaths enum, absent from every GET schema): event-only
-  allowlists in `projections.py`.
+  (no server time filter; `since` walks the whole 90-day feed, filters,
+  and sorts by `occurredAt` newest first; `mergePatch`/`previousValues`
+  re-projected through the changed resource's allowlist, recursively,
+  omitted with `patchOmitted` for unknown types); `list_webhooks` (config
+  view; `secret` never returned; since v0.1.1 `url` is dropped entirely,
+  because the hostname itself can be the capability, e.g.
+  `<secret>.m.pipedream.net`, and only `url_fingerprint` = first 8 hex
+  chars of sha256(full url) is returned; `enabled` derived from `status`).
+  Event patches for the five account resource types additionally allow
+  `inFlightBalance` (documented in the webhook filterPaths enum, absent
+  from every GET schema): event-only allowlists in `projections.py`.
 - Client-side windows (`since` on events, `start`/`end` on treasury
-  transactions) walk newest-first and stop at the first row older than
-  the window or once `limit + 1` rows inside it are collected, so an
-  `end`-only window never walks the whole history. For events the
-  newest-first assumption is verified as the walk goes
-  (`_OrderedWindowStop`): a row newer than the row before it disables the
-  early stop, the full 90-day feed is walked, and the result carries
-  `order_verified: false`; otherwise `order_verified: true`.
+  transactions) walk the full bounded feed (events: 90 days; treasury:
+  `MAX_PAGES`), filter and sort locally, then apply `limit`; `truncated`
+  is exact. The v0.1.0 early stop and `order_verified` were removed in
+  v0.1.1 (M5: an out-of-order page silently dropped in-window rows). The
+  cost is the whole feed.
 - `get_invoice_pdf` tries the invoice uuid path first and, on 404, the
-  invoice's `slug` (the docs disagree on which the path takes); the slug
-  never appears in output or error text.
+  invoice's `slug` (the docs disagree on which the path takes); neither
+  the slug nor the id appears in output or error text.
 - `list_statements` validates real calendar dates and enforces Mercury's
   3-month `start`/`end` span before any request; `list_invoices` matches
   `status` case-insensitively and rejects unknown values.
-- Allowlists are top-level; nested pass-through objects are documented
-  in docs/tools.md and pinned to their live key sets by
-  `test_nested_pass_through_objects_match_the_live_schema`.
-- `validate_api_base` rejects credentials in the URL without echoing them.
-  Error bodies on streamed downloads are read to at most 64 KB.
+- Allowlists apply at every level (v0.1.1, m1); the eleven nested shapes
+  are documented in docs/tools.md, pinned to their live key sets by
+  `test_nested_allowlists_match_the_live_schema_and_the_fixtures`, and
+  guarded by a canary test that plants unknown nested keys.
+- `validate_api_base` rejects credentials in the URL without echoing them
+  and, since v0.1.1, restricts the host to `api.mercury.com`,
+  `api-sandbox.mercury.com`, or loopback unless `allow_custom` (the CLIs'
+  `--allow-custom-api-base`); `MercuryClient` itself validates shape only.
+  Error bodies are never read at all.
 - Every id that becomes a path segment is validated (`validate_path_id`)
-  so an argument can never redirect a request to another endpoint.
+  so an argument can never redirect a request to another endpoint; the
+  error names the parameter, never the value.
+- Error boundary (v0.1.1, M1): every `MercuryAPIError` is fixed text (HTTP
+  status, `endpoint_label` with ids as `{id}`, a hint by status); no
+  upstream body, header, httpx repr, or caller argument is ever quoted;
+  the server's `_call` scrubs every message with the entity's token as a
+  known secret (`MercuryClient.scrub`) before raising `ToolError`.
+- Byte limits (v0.1.1, M4): `Accept-Encoding: identity` on every request;
+  any other `Content-Encoding` is refused before the body is read; caps
+  (`MAX_DOWNLOAD_BYTES` 10 MB, `MAX_JSON_BYTES` 32 MB) apply to raw wire
+  bytes while streaming.
+- Pagination (v0.1.1, M6): a page with no fresh rows, no usable cursor, or
+  a non-advancing cursor while more pages are advertised raises
+  `IncompletePaginationError`; `reportable_totals` fails loudly.
 - Tools return `list[ContentBlock]` for PDFs; SDK v2 passes content
   blocks through unstructured (`_convert_to_content` in
   `mcp.server.mcpserver.utilities.func_metadata`), verified 2026-09-12.
@@ -293,17 +317,26 @@ stdio only; the server never opens a network listener.
   `token_env: MERCURY_TOKEN_ACME_MAIN`). The package resolves env vars
   only; it knows nothing about any secret manager.
 - `.env.example` committed with placeholders; `.env` gitignored.
+- `token_env` must match `^MERCURY_TOKEN_[A-Z0-9_]+$` (v0.1.1) so a
+  registry can never name an unrelated env var as the bearer token.
 - Never log, print, or return more than the last 4 characters of any
   token. A missing token for one entity is a clean per-entity error, not
-  a crash, and must not affect other entities.
+  a crash, and must not affect other entities. Both CLIs warn at startup,
+  per entity, when a configured token lacks the `secret-token:` prefix
+  (last four characters only).
 - Dotenv policy: configuration is read from process environment variables
   only. A dotenv file is loaded solely when `--env-file <path>` is passed
   (existing env vars win). There is no implicit `.env` search: python-dotenv's
   default walks up from the installed package directory, which under `uvx`
   or a clone would read unrelated `.env` files.
-- `--api-base` / `MERCURY_API_BASE` must be `https://`; plain `http://` is
-  accepted only for `localhost` / `127.0.0.1` mocks. Anything else is a
+- `--api-base` / `MERCURY_API_BASE` must be `https://api.mercury.com`,
+  `https://api-sandbox.mercury.com`, or loopback (plain `http://` only
+  there) unless `--allow-custom-api-base` is passed. Anything else is a
   clean startup error (exit 2).
+- Every startup error path (missing/malformed registry incl. non-string
+  YAML keys, unreadable file, bad `--env-file`, disallowed host) is one
+  line on stderr and exit 2 for both CLIs (`load_startup_config`); the
+  redacting excepthooks are installed before the registry loads (m4).
 - `main()` installs a redacting `logging.Filter` on the root logger and its
   handlers so SDK ERROR tracebacks on stderr cannot carry a token, routes
   uncaught main-thread and worker-thread exceptions through the same
@@ -378,6 +411,11 @@ not use the third-party standalone `fastmcp` package — official SDK only.
    tags `mercury-v0.1.0` on the monorepo after review. Acceptance: gitleaks
    is clean and a fresh clone installs and passes tests from the README
    alone.
+
+5. v0.1.1 (built 2026-09-13): fixes from an independent external review
+   of 0.1.0 (six majors M1-M6, four minors m1-m4, hardening). See
+   CHANGELOG.md; tests in `tests/test_external_review.py` are labelled by
+   finding. The reviewer's reproduction scripts live outside the repo.
 
 ## Definition of done for public
 

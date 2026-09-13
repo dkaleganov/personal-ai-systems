@@ -327,7 +327,8 @@ def make_client(fake_api: FakeMercury):
 
 @pytest.fixture
 def server(registry: Registry, make_client, env_tokens: None):
-    return build_server(registry, api_base=FAKE_API_BASE, client_factory=make_client)
+    # Document tools are opt-in; the shared fixture enables them so every tool is exercised.
+    return build_server(registry, api_base=FAKE_API_BASE, client_factory=make_client, allow_documents=True)
 
 
 @pytest.fixture

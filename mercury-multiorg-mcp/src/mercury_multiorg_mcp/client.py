@@ -5,22 +5,37 @@ Validated against the live OpenAPI at docs.mercury.com on 2026-09-11
 ``/reference/listaccounttransactions.md``, ``/docs/getting-started.md``,
 ``/docs/api-token-security-policies.md``), on 2026-09-12 for Phase 2
 (``/reference/getrecipients.md``, ``/reference/getrecipient.md``,
-``/reference/listrecipientsattachments.md``), and on 2026-09-12 for Phase 3
+``/reference/listrecipientsattachments.md``), on 2026-09-12 for Phase 3
 (``getorganization``, ``getaccountstatements``, ``getstatementpdf``,
 ``gettreasury``, ``gettreasurytransactions``, ``gettreasurystatements``,
 ``listcredit``, ``listcards``, ``getcard``, ``listcategories``,
 ``listmerchants``, ``listcustomers``, ``listinvoices``, ``getinvoice``,
 ``getinvoicepdf``, ``listinvoiceattachments``, ``getusers``, ``getevents``,
-``getwebhooks``). Notes where the live docs differ from the build brief
-are marked ``DOCS:`` below.
+``getwebhooks``), and again on 2026-09-13 for v0.1.1 (the PDF endpoints
+document ``application/pdf`` only; ``getevents`` and
+``gettreasurytransactions`` still name no sort key for ``order``). Notes
+where the live docs differ from the build brief are marked ``DOCS:`` below.
 
 Only ``GET`` is implemented. There is no method for any endpoint that can
 change state, and :meth:`MercuryClient._fetch` is the single choke point for
 every request, so adding a write path would have to be deliberate.
+
+Error boundary (v0.1.1): every :class:`MercuryAPIError` raised here carries
+fixed text only: an HTTP status, an endpoint label with ids replaced by
+``{id}``, and a hint chosen from a table. Upstream response bodies, header
+values (including ``Content-Type``), httpx exception reprs, and
+caller-supplied ids never reach a message.
+
+Byte limits (v0.1.1): every request declines compression
+(``Accept-Encoding: identity``) and a response that arrives with any other
+``Content-Encoding`` is refused before its body is read, so the caps below
+are enforced on raw wire bytes while streaming: ``MAX_DOWNLOAD_BYTES`` for
+PDFs, ``MAX_JSON_BYTES`` for JSON.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import re
@@ -31,9 +46,10 @@ from urllib.parse import urlsplit
 import anyio
 import httpx
 
-from .errors import MercuryAPIError, redact, token_suffix
+from .errors import IncompletePaginationError, MercuryAPIError, redact, token_suffix
 
 DEFAULT_API_BASE = "https://api.mercury.com"
+SANDBOX_API_BASE = "https://api-sandbox.mercury.com"
 API_BASE_ENV = "MERCURY_API_BASE"
 # DOCS: sandbox base is https://api-sandbox.mercury.com (same /api/v1 prefix).
 # Users point MERCURY_API_BASE there with a sandbox-created token.
@@ -46,24 +62,75 @@ MAX_PAGES = 200
 
 _RETRY_STATUSES = frozenset({429, 502, 503, 504})
 
-# Largest binary (statement / invoice PDF) the client will buffer.
+# Largest binary (statement / invoice PDF) the client will buffer, in wire bytes.
 MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024
-# Largest error body read on a streamed response before it is scrubbed and truncated.
-ERROR_BODY_CAP = 64 * 1024
+# Largest JSON body the client will buffer, in wire bytes.
+MAX_JSON_BYTES = 32 * 1024 * 1024
+# Bytes at the end of a PDF body searched for the %%EOF marker.
+PDF_EOF_WINDOW = 2048
+# Content types accepted for a PDF download (parameters such as charset ignored).
+PDF_CONTENT_TYPES = frozenset({"application/pdf", "application/octet-stream"})
 
 # Mercury ids are UUIDs. Anything that could change the request path (a
 # slash, a dot segment, a query) is rejected before it reaches the URL.
 _PATH_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
+# Fixed hints by HTTP status. Nothing from the response is ever quoted.
+_STATUS_HINTS: dict[int, str] = {
+    400: "request rejected by Mercury (check the arguments)",
+    401: "token rejected (the entity's token is invalid, deleted, or for another environment)",
+    403: "token lacks permission for this endpoint",
+    404: "not found",
+    429: "rate limited (retries exhausted)",
+}
+
+# Path segments that are endpoint words; every other segment is an id and is
+# shown as `{id}` in error text.
+_ENDPOINT_WORDS = frozenset(
+    {
+        "accounts", "account", "transactions", "recipients", "attachments", "organization",
+        "statements", "pdf", "treasury", "credit", "cards", "categories", "merchants",
+        "ar", "customers", "invoices", "users", "events", "webhooks",
+    }
+)
+
+
+def endpoint_label(path: str) -> str:
+    """``GET /account/{id}/statements`` for ``/account/<uuid>/statements``: ids never appear in error text."""
+    parts = [seg if seg in _ENDPOINT_WORDS else "{id}" for seg in path.strip("/").split("/") if seg != ""]
+    return "GET /" + "/".join(parts)
+
 
 def validate_path_id(value: str, label: str) -> str:
-    """Return ``value`` if it is a safe single path segment, else raise ``ValueError``."""
+    """Return ``value`` if it is a safe single path segment, else raise ``ValueError``.
+
+    The message names the parameter, never the value (an argument could be
+    anything, including a secret pasted by mistake).
+    """
     if not isinstance(value, str) or not _PATH_ID_RE.fullmatch(value):  # fullmatch: `$` would allow a trailing newline
-        raise ValueError(f"{label} must be an id of letters, digits, '-' or '_' (got {value!r})")
+        raise ValueError(f"{label}: invalid id format (expected 1-64 characters: letters, digits, '-' or '_')")
     return value
 
 
+def validate_pdf_bytes(body: bytes, label: str, *, status_code: int | None = None, path: str | None = None) -> None:
+    """Require the ``%PDF-`` header and a trailing ``%%EOF`` marker; raise a fixed-text error otherwise.
+
+    This is structural validation only (a document can still be malformed
+    inside); it rejects HTML error pages, empty bodies, and truncated
+    downloads without ever quoting the body.
+    """
+    if not body.startswith(b"%PDF-"):
+        raise MercuryAPIError(f"{label} did not return a PDF (missing %PDF- header)", status_code=status_code, path=path)
+    if b"%%EOF" not in body[-PDF_EOF_WINDOW:]:
+        raise MercuryAPIError(
+            f"{label} did not return a complete PDF (no %%EOF marker in the last {PDF_EOF_WINDOW} bytes)",
+            status_code=status_code,
+            path=path,
+        )
+
+
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_ALLOWED_HOSTS = frozenset({"api.mercury.com", "api-sandbox.mercury.com"})
 
 
 def api_base_from_env() -> str:
@@ -71,12 +138,16 @@ def api_base_from_env() -> str:
     return os.environ.get(API_BASE_ENV, "").strip() or DEFAULT_API_BASE
 
 
-def validate_api_base(url: str) -> str:
-    """Require ``https://`` for the API host; plain ``http://`` only on loopback (mocks).
+def validate_api_base(url: str, *, allow_custom: bool = False) -> str:
+    """Validate the API host and return it with any trailing slash removed.
 
-    Returns the host URL with any trailing slash removed. Raises ``ValueError``
-    with a message safe to print: the rejected value is never echoed, since a
-    mistyped URL can carry a credential in its userinfo, path, or query.
+    Always required: a bare ``https://`` host (``http://`` only on loopback,
+    for mocks), no credentials, path, query, or fragment. Unless
+    ``allow_custom`` is true the host must also be Mercury's production or
+    sandbox host, or loopback: a value inherited from the environment can
+    then never point the bearer token at another destination. Raises
+    ``ValueError`` with a message safe to print: the rejected value is never
+    echoed, since a mistyped URL can carry a credential.
     """
     candidate = (url or "").strip().rstrip("/")
     try:
@@ -94,6 +165,11 @@ def validate_api_base(url: str) -> str:
         )
     if parts.scheme == "http" and host not in _LOOPBACK_HOSTS:
         raise ValueError(f"api_base must use https:// (plain http is only allowed for localhost/127.0.0.1); got host {host!r}")
+    if not allow_custom and host not in _ALLOWED_HOSTS and host not in _LOOPBACK_HOSTS:
+        raise ValueError(
+            f"api_base host {host!r} is not {DEFAULT_API_BASE}, {SANDBOX_API_BASE}, or loopback; "
+            "pass --allow-custom-api-base to use another host deliberately"
+        )
     return candidate
 
 
@@ -105,7 +181,10 @@ class MercuryClient:
             Held only on this object; never logged or returned beyond its
             last four characters.
         api_base: Host such as ``https://api.mercury.com``; ``/api/v1`` is
-            appended here.
+            appended here. Shape-validated only: the production/sandbox
+            host allowlist is enforced where the value enters the process
+            (the CLIs, via ``--allow-custom-api-base``), so programmatic
+            callers and tests can point at a mock.
         timeout: Per-request timeout in seconds.
         max_retries: Attempts on 429/502/503/504 before giving up.
         transport: Optional ``httpx.AsyncBaseTransport`` (tests inject a
@@ -126,18 +205,21 @@ class MercuryClient:
         if not token or not token.strip():
             raise ValueError("token must be a non-empty string")
         self._token = token.strip()
-        base = validate_api_base(api_base or api_base_from_env())
+        base = validate_api_base(api_base or api_base_from_env(), allow_custom=True)
         self.base_url = base + API_PREFIX
         self.max_retries = max(0, int(max_retries))
         self._sleep = sleep or anyio.sleep
         # DOCS: getting-started documents HTTP Basic (token as username) as
         # primary and Bearer "for convenience"; the OpenAPI securityScheme is
         # bearerAuth. Bearer is used here, matching the brief and the schema.
+        # Accept-Encoding: identity declines compression so every byte cap
+        # applies to what actually crosses the wire (M4).
         self._http = httpx.AsyncClient(
             base_url=self.base_url,
             headers={
                 "Authorization": f"Bearer {self._token}",
                 "Accept": "application/json",
+                "Accept-Encoding": "identity",
                 "User-Agent": "mercury-multiorg-mcp",
             },
             timeout=timeout,
@@ -165,96 +247,125 @@ class MercuryClient:
 
     # -- transport --------------------------------------------------------
 
-    def _scrub(self, text: str) -> str:
+    def scrub(self, text: str) -> str:
+        """Redact token shapes, Authorization headers, and this client's own token from ``text``."""
         return redact(text, self._token)
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        """GET ``path`` and return the decoded JSON body. See :meth:`_fetch`."""
+        """GET ``path`` and return the decoded JSON body (wire bytes capped at ``MAX_JSON_BYTES``)."""
+        label = endpoint_label(path)
         resp = await self._fetch(path, params)
+        body = await self._read_body(resp, MAX_JSON_BYTES, label, path)
         try:
-            return resp.json()
+            return json.loads(body)
         except ValueError:
-            raise MercuryAPIError(
-                f"Mercury returned non-JSON body for GET {path}", status_code=resp.status_code, path=path
-            ) from None
+            raise MercuryAPIError(f"{label} returned a body that is not JSON", status_code=resp.status_code, path=path) from None
 
-    async def _request(self, path: str, params: dict[str, Any] | None = None) -> httpx.Response:
-        """GET ``path`` with the body read; see :meth:`_fetch`."""
-        return await self._fetch(path, params)
+    async def _download(
+        self, path: str, *, max_bytes: int = MAX_DOWNLOAD_BYTES, accepted_types: frozenset[str] = PDF_CONTENT_TYPES
+    ) -> tuple[bytes, str]:
+        """GET a binary body (statement / invoice PDF) without ever buffering more than ``max_bytes`` of wire data.
 
-    async def _download(self, path: str, *, max_bytes: int = MAX_DOWNLOAD_BYTES) -> tuple[bytes, str]:
-        """GET a binary body (statement / invoice PDF) without ever buffering more than ``max_bytes``.
-
-        Returns ``(body, content_type)``. A ``Content-Length`` above the cap
-        fails before any body is read; a body that grows past the cap while
-        streaming fails as soon as it does; an error body is read to at most
-        ``ERROR_BODY_CAP`` before being scrubbed.
+        Returns ``(body, content_type)``. The declared ``Content-Type`` must
+        be one of ``accepted_types`` (checked before any body is read; the
+        actual value is never quoted in an error), a ``Content-Length``
+        above the cap fails before any body is read, and a body that grows
+        past the cap while streaming fails as soon as it does. The caller
+        still validates the bytes with :func:`validate_pdf_bytes`.
         """
-        resp = await self._fetch(path, None, stream=True)
+        label = endpoint_label(path)
+        resp = await self._fetch(path, None)
+        content_type = resp.headers.get("Content-Type", "")
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if media_type not in accepted_types:
+            await resp.aclose()
+            raise MercuryAPIError(
+                f"{label} did not return a PDF (unexpected content type)", status_code=resp.status_code, path=path
+            )
+        body = await self._read_body(resp, max_bytes, label, path)
+        return body, media_type
+
+    async def _read_body(self, resp: httpx.Response, max_bytes: int, label: str, path: str) -> bytes:
+        """Read a streamed success response as raw wire bytes, never more than ``max_bytes``; always closes it."""
         try:
+            encoding = resp.headers.get("Content-Encoding", "")
+            codings = [c.strip().lower() for c in encoding.split(",") if c.strip()]
+            if any(c != "identity" for c in codings):
+                # Compression was declined; a compressed body would let a
+                # small wire payload expand past every cap (M4).
+                raise MercuryAPIError(
+                    f"{label} returned a compressed body, which this client refuses (identity encoding was requested)",
+                    status_code=resp.status_code,
+                    path=path,
+                )
             declared = resp.headers.get("Content-Length", "")
             if declared.isdigit() and int(declared) > max_bytes:
                 raise MercuryAPIError(
-                    f"GET {path} is {int(declared)} bytes, above the {max_bytes}-byte limit",
+                    f"{label} declares {int(declared)} bytes, above the {max_bytes}-byte limit",
                     status_code=resp.status_code,
                     path=path,
                 )
             chunks: list[bytes] = []
             size = 0
+            # A live response streams raw wire bytes. A response whose body
+            # was already buffered before it reached us (httpx.MockTransport
+            # builds those from `content=`) refuses aiter_raw(); its bytes
+            # are served from the buffer instead. Both paths are wire bytes
+            # once the identity check above has passed.
+            iterator = resp.aiter_bytes() if resp.is_stream_consumed else resp.aiter_raw()
             try:
-                async for chunk in resp.aiter_bytes():
+                async for chunk in iterator:
                     size += len(chunk)
                     if size > max_bytes:
                         raise MercuryAPIError(
-                            f"GET {path} exceeded the {max_bytes}-byte limit while downloading",
+                            f"{label} exceeded the {max_bytes}-byte limit while downloading",
                             status_code=resp.status_code,
                             path=path,
                         )
                     chunks.append(chunk)
             except httpx.HTTPError as exc:
-                # A read/reset in the middle of the body: same wrapping and
-                # scrubbing as every other transport failure. Not retried, the
-                # partial body is discarded.
+                # A read/reset in the middle of the body: not retried, the
+                # partial body is discarded, the exception is named by class
+                # only (httpx reprs can embed the request and its headers).
                 raise MercuryAPIError(
-                    f"Transport error while downloading GET {path} after {size} bytes: {self._scrub(repr(exc))}",
+                    f"Transport error while reading {label} after {size} bytes ({exc.__class__.__name__})",
                     status_code=resp.status_code,
                     path=path,
                 ) from None
         finally:
             await resp.aclose()
-        return b"".join(chunks), resp.headers.get("Content-Type", "")
+        return b"".join(chunks)
 
-    async def _fetch(self, path: str, params: dict[str, Any] | None = None, *, stream: bool = False) -> httpx.Response:
+    async def _fetch(self, path: str, params: dict[str, Any] | None = None) -> httpx.Response:
         """Perform a GET with bounded backoff. The only request method in the package.
 
-        Returns the successful (``< 400``) response, body already read unless
-        ``stream`` is true (then the caller reads and closes it). Retries (up
+        Returns the successful (``< 400``) response *unread* (streamed); the
+        caller reads it through :meth:`_read_body` or closes it. Retries (up
         to ``max_retries``) on 429/502/503/504 and on ``httpx.TransportError``
         (connect failures, timeouts, resets): every request here is an
-        idempotent GET, so a retry can never double-apply.
+        idempotent GET, so a retry can never double-apply. An error status
+        is reported as fixed text; its body is never read.
         """
+        label = endpoint_label(path)
         clean_params = {k: v for k, v in (params or {}).items() if v is not None}
         attempt = 0
         while True:
             try:
                 request = self._http.build_request("GET", path, params=clean_params)
-                resp = await self._http.send(request, stream=stream)
+                resp = await self._http.send(request, stream=True)
             except httpx.TransportError as exc:
                 if attempt < self.max_retries:
                     await self._sleep(self._backoff_seconds(None, attempt))
                     attempt += 1
                     continue
-                # httpx exception reprs can embed the request (and its headers).
                 raise MercuryAPIError(
-                    f"Transport error calling GET {path} after {attempt + 1} attempts: {self._scrub(repr(exc))}",
+                    f"Transport error calling {label} after {attempt + 1} attempts ({exc.__class__.__name__})",
                     path=path,
                 ) from None
             except (httpx.HTTPError, httpx.InvalidURL) as exc:
                 # InvalidURL is not an HTTPError: it is raised by build_request
                 # for a path that cannot be encoded. No request was sent.
-                raise MercuryAPIError(
-                    f"HTTP error calling GET {path}: {self._scrub(repr(exc))}", path=path
-                ) from None
+                raise MercuryAPIError(f"HTTP error calling {label} ({exc.__class__.__name__})", path=path) from None
 
             if resp.status_code in _RETRY_STATUSES and attempt < self.max_retries:
                 await resp.aclose()
@@ -263,37 +374,14 @@ class MercuryClient:
                 continue
 
             if resp.status_code >= 400:
-                try:
-                    raw = await self._read_capped(resp, ERROR_BODY_CAP) if stream else resp.content
-                except httpx.HTTPError as exc:
-                    await resp.aclose()
-                    raise MercuryAPIError(
-                        f"Mercury returned HTTP {resp.status_code} for GET {path}; body unreadable: {self._scrub(repr(exc))}",
-                        status_code=resp.status_code,
-                        path=path,
-                    ) from None
-                # Scrub first, then truncate: a cut in the middle of a token
-                # would otherwise defeat the token-shape pattern.
-                body = self._scrub(raw.decode("utf-8", "replace"))[:500]
                 await resp.aclose()
+                hint = _STATUS_HINTS.get(resp.status_code)
                 raise MercuryAPIError(
-                    f"Mercury returned HTTP {resp.status_code} for GET {path}: {body}",
+                    f"Mercury returned HTTP {resp.status_code} for {label}" + (f": {hint}" if hint else ""),
                     status_code=resp.status_code,
                     path=path,
                 )
             return resp
-
-    @staticmethod
-    async def _read_capped(resp: httpx.Response, cap: int) -> bytes:
-        """Read at most ``cap`` bytes of a streamed body (error bodies never need more)."""
-        chunks: list[bytes] = []
-        size = 0
-        async for chunk in resp.aiter_bytes():
-            chunks.append(chunk[: cap - size])
-            size += len(chunk)
-            if size >= cap:
-                break
-        return b"".join(chunks)
 
     @staticmethod
     def _backoff_seconds(resp: httpx.Response | None, attempt: int) -> float:
@@ -383,9 +471,10 @@ class MercuryClient:
         """One authenticated ``GET /accounts?limit=1``; returns the HTTP status.
 
         Used by the keepalive CLI: any authenticated call resets Mercury's
-        45-day inactivity clock for the token.
+        45-day inactivity clock for the token. The body is not read.
         """
-        resp = await self._request("/accounts", {"limit": 1})
+        resp = await self._fetch("/accounts", {"limit": 1})
+        await resp.aclose()
         return resp.status_code
 
     # -- Phase 3 read endpoints -------------------------------------------
@@ -421,17 +510,21 @@ class MercuryClient:
         )
 
     async def get_statement_pdf(self, statement_id: str, *, max_bytes: int = MAX_DOWNLOAD_BYTES) -> tuple[bytes, str]:
-        """``GET /statements/{id}/pdf``: binary PDF, capped. Returns ``(body, content_type)``.
+        """``GET /statements/{id}/pdf``: validated PDF bytes, capped. Returns ``(body, media_type)``.
 
         DOCS: the path parameter is a bare uuid described only as "ID for the
-        account statement". Treasury statements carry ids of the same
+        account statement"; the documented success content type is
+        ``application/pdf``. Treasury statements carry ids of the same
         ``AccountStatementId`` type as depository statements, so they *may*
         be accepted here; the docs do not say. Treasury statements otherwise
         expose only a ``downloadUrl``, which this package never fetches or
         returns.
         """
         statement_id = validate_path_id(statement_id, "statement_id")
-        return await self._download(f"/statements/{statement_id}/pdf", max_bytes=max_bytes)
+        path = f"/statements/{statement_id}/pdf"
+        body, media_type = await self._download(path, max_bytes=max_bytes)
+        validate_pdf_bytes(body, endpoint_label(path), path=path)
+        return body, media_type
 
     async def list_treasury(self) -> list[dict[str, Any]]:
         """``GET /treasury``: all treasury accounts (cursor-paginated like /accounts)."""
@@ -443,21 +536,24 @@ class MercuryClient:
         *,
         limit: int | None = None,
         order: str = "desc",
-        stop_at: Callable[[dict[str, Any]], bool] | None = None,
     ) -> list[dict[str, Any]]:
         """``GET /treasury/{id}/transactions``, newest first by default.
 
         DOCS: this endpoint uses an *integer* ``cursor`` (the response's
         ``cursor`` is passed back to get the next batch; null when done), not
         the ``start_after`` id cursor of the other list endpoints, and it has
-        no date filters. Callers wanting a date window filter on
-        ``canonicalDay`` client-side; ``stop_at`` ends the walk early once
-        rows are older than wanted (rows arrive newest first).
+        no date filters; ``order`` is documented as asc/desc with no sort key
+        named. Callers wanting a date window walk the whole ledger
+        (``limit=None``, bounded by ``MAX_PAGES``) and filter on
+        ``canonicalDay`` themselves. A non-null cursor that does not advance,
+        or a page with no fresh rows while a cursor is still offered, is an
+        :class:`IncompletePaginationError` rather than a silently short list.
         """
         treasury_id = validate_path_id(treasury_id, "treasury_id")
         if order not in ("asc", "desc"):
             raise ValueError("order must be 'asc' or 'desc'")
         path = f"/treasury/{treasury_id}/transactions"
+        label = endpoint_label(path)
         collected: list[dict[str, Any]] = []
         seen: set[Any] = set()
         cursor: int | None = None
@@ -469,25 +565,26 @@ class MercuryClient:
             data = await self._get(path, {"limit": page_size, "order": order, "cursor": cursor})
             items = data.get("transactions") if isinstance(data, dict) else None
             if not isinstance(items, list):
-                raise MercuryAPIError(f"Unexpected response shape from GET {path}: missing 'transactions' list", path=path)
+                raise MercuryAPIError(f"Unexpected response shape from {label}: missing 'transactions' list", path=path)
             # Same seen-id dedupe as the id-cursor walk: an overlapping page is never counted twice.
             rows = [it for it in items if isinstance(it, dict) and it.get("id") not in seen]
             for it in rows:
                 seen.add(it.get("id"))
-            if stop_at is not None:
-                cut = next((i for i, it in enumerate(rows) if stop_at(it)), None)
-                if cut is not None:
-                    collected.extend(rows[:cut])
-                    break
             collected.extend(rows)
             nxt = data.get("cursor")
-            if not rows or not isinstance(nxt, int) or isinstance(nxt, bool) or nxt == cursor:  # non-advancing cursor
+            if nxt is None:
                 break
+            if not isinstance(nxt, int) or isinstance(nxt, bool) or nxt == cursor or not rows:
+                raise IncompletePaginationError(
+                    f"{label}: incomplete pagination (the API offered another page but the cursor did not advance "
+                    "or the page repeated already-seen rows); the result would be partial",
+                    path=path,
+                )
             cursor = nxt
         else:
             if limit is None or len(collected) < limit:
                 raise MercuryAPIError(
-                    f"GET {path} has more than {MAX_PAGES} pages ({len(collected)} items collected); "
+                    f"{label} has more than {MAX_PAGES} pages ({len(collected)} items collected); "
                     "narrow the query or raise MAX_PAGES",
                     path=path,
                 )
@@ -529,9 +626,10 @@ class MercuryClient:
     async def get_card(self, card_id: str) -> dict[str, Any]:
         """``GET /cards/{id}``. Never returns PAN/CVC (those live behind the write-scoped Vault API)."""
         card_id = validate_path_id(card_id, "card_id")
-        data = await self._get(f"/cards/{card_id}")
+        path = f"/cards/{card_id}"
+        data = await self._get(path)
         if not isinstance(data, dict):
-            raise MercuryAPIError(f"Unexpected response shape from GET /cards/{card_id}", path=f"/cards/{card_id}")
+            raise MercuryAPIError(f"Unexpected response shape from {endpoint_label(path)}", path=path)
         return data
 
     async def list_categories(self) -> list[dict[str, Any]]:
@@ -557,42 +655,48 @@ class MercuryClient:
     async def get_invoice(self, invoice_id: str) -> dict[str, Any]:
         """``GET /ar/invoices/{id}`` including line items."""
         invoice_id = validate_path_id(invoice_id, "invoice_id")
-        data = await self._get(f"/ar/invoices/{invoice_id}")
+        path = f"/ar/invoices/{invoice_id}"
+        data = await self._get(path)
         if not isinstance(data, dict):
-            raise MercuryAPIError(f"Unexpected response shape from GET /ar/invoices/{invoice_id}", path=f"/ar/invoices/{invoice_id}")
+            raise MercuryAPIError(f"Unexpected response shape from {endpoint_label(path)}", path=path)
         return data
 
     async def get_invoice_pdf(self, invoice_id: str, *, max_bytes: int = MAX_DOWNLOAD_BYTES) -> tuple[bytes, str]:
-        """``GET /ar/invoices/{id}/pdf``: binary PDF, capped. Returns ``(body, content_type)``.
+        """``GET /ar/invoices/{id}/pdf``: validated PDF bytes, capped. Returns ``(body, media_type)``.
 
         DOCS: the reference page types the path parameter as the invoice
         uuid (``invoiceId``), while the invoice schema says the public
         ``slug`` is "used to construct ... the URL to retrieve the PDF".
         Both are tried: the id first; on 404 the invoice is fetched and its
-        slug used instead. The slug never leaves the client: errors name the
-        invoice id only.
+        slug used instead. Neither the slug nor the id appears in error
+        text (endpoint labels mask every id segment).
         """
         invoice_id = validate_path_id(invoice_id, "invoice_id")
         id_path = f"/ar/invoices/{invoice_id}/pdf"
+        label = endpoint_label(id_path)
         try:
-            return await self._download(id_path, max_bytes=max_bytes)
+            body, media_type = await self._download(id_path, max_bytes=max_bytes)
         except MercuryAPIError as exc:
             if exc.status_code != 404:
                 raise
             by_id = exc
+        else:
+            validate_pdf_bytes(body, label, path=id_path)
+            return body, media_type
         invoice = await self.get_invoice(invoice_id)
         slug = invoice.get("slug")
         if not isinstance(slug, str) or not _PATH_ID_RE.fullmatch(slug):
             raise by_id
         try:
-            return await self._download(f"/ar/invoices/{slug}/pdf", max_bytes=max_bytes)
+            body, media_type = await self._download(f"/ar/invoices/{slug}/pdf", max_bytes=max_bytes)
         except MercuryAPIError as exc:
-            message = str(exc).replace(slug, invoice_id)
             raise MercuryAPIError(
-                f"{message} (invoice {invoice_id}: not found by id, then tried by slug)",
+                f"{exc} (not found by invoice id; the invoice's slug path was tried next)",
                 status_code=exc.status_code,
                 path=id_path,
             ) from None
+        validate_pdf_bytes(body, label, path=id_path)
+        return body, media_type
 
     async def list_invoice_attachments(self, invoice_id: str) -> list[dict[str, Any]]:
         """``GET /ar/invoices/{id}/attachments``: ``{"attachments": [{id, fileName, url}]}`` (not paginated)."""
@@ -601,7 +705,7 @@ class MercuryClient:
         data = await self._get(path)
         items = data.get("attachments") if isinstance(data, dict) else None
         if not isinstance(items, list):
-            raise MercuryAPIError(f"Unexpected response shape from GET {path}: missing 'attachments' list", path=path)
+            raise MercuryAPIError(f"Unexpected response shape from {endpoint_label(path)}: missing 'attachments' list", path=path)
         return [it for it in items if isinstance(it, dict)]
 
     async def list_users(self) -> list[dict[str, Any]]:
@@ -615,17 +719,13 @@ class MercuryClient:
         resource_id: str | None = None,
         limit: int | None = None,
         order: str = "desc",
-        stop_at: Callable[[dict[str, Any]], bool] | None = None,
     ) -> list[dict[str, Any]]:
         """``GET /events`` (cursor-paginated; ``resourceType`` / ``resourceId`` filters).
 
         DOCS: there is no time filter; events are kept for 90 days. ``order``
-        is documented only as asc/desc with no sort key named; the example
-        ids are time-based (UUIDv1), so ``desc`` is taken to mean newest
-        first. A ``since`` window is applied client-side on that assumption
-        by walking newest-first and stopping at the first event older than
-        wanted (``stop_at``); the server tool verifies the ordering as it
-        goes and falls back to a full walk if a page breaks it.
+        is documented only as asc/desc with no sort key named, so a caller
+        applying a time window must walk the whole feed (``limit=None``) and
+        filter and sort the rows itself; no early stop is offered here.
         """
         if order not in ("asc", "desc"):
             raise ValueError("order must be 'asc' or 'desc'")
@@ -634,7 +734,6 @@ class MercuryClient:
             "events",
             params={"resourceType": resource_type, "resourceId": resource_id, "order": order},
             max_items=limit,
-            stop_at=stop_at,
         )
 
     async def list_webhooks(self) -> list[dict[str, Any]]:
@@ -650,15 +749,10 @@ class MercuryClient:
         *,
         params: dict[str, Any],
         max_items: int | None,
-        stop_at: Callable[[dict[str, Any]], bool] | None = None,
         id_key: str = "id",
     ) -> list[dict[str, Any]]:
         """Walk a ``start_after`` cursor until exhausted or ``max_items`` collected.
 
-        ``stop_at`` (for server-ordered streams) ends the walk at the first
-        item it accepts; that item and everything after it are dropped. It
-        is called on every item of a page before the cut is applied, and a
-        predicate exposing a true ``disabled`` attribute cancels the cut.
         ``id_key`` names the item's id field (``userId`` on /users).
 
         DOCS: the OpenAPI describes ``page.nextPage`` only as an ID and
@@ -668,10 +762,15 @@ class MercuryClient:
         actually received and ``nextPage`` is used only as a "more pages"
         signal. That is correct under either reading. Page length is not
         used as a stop signal because the server-side page cap is not
-        documented; the seen-id set and ``MAX_PAGES`` bound the loop, and
-        exhausting ``MAX_PAGES`` with more pages remaining is an error rather
-        than a silently short result.
+        documented; the seen-id set and ``MAX_PAGES`` bound the loop.
+
+        Completeness (M6): while ``nextPage`` is present, a page that adds no
+        fresh rows or yields no usable cursor is an
+        :class:`IncompletePaginationError`; exhausting ``MAX_PAGES`` with
+        more pages remaining is an error too. A partial list is never
+        returned as if it were complete.
         """
+        label = endpoint_label(path)
         collected: list[dict[str, Any]] = []
         seen: set[str] = set()
         cursor: str | None = None
@@ -683,27 +782,22 @@ class MercuryClient:
             data = await self._get(path, {**params, "limit": page_size, "start_after": cursor})
             items = data.get(items_key) if isinstance(data, dict) else None
             if not isinstance(items, list):
-                raise MercuryAPIError(f"Unexpected response shape from GET {path}: missing '{items_key}' list", path=path)
+                raise MercuryAPIError(f"Unexpected response shape from {label}: missing '{items_key}' list", path=path)
             fresh = [it for it in items if isinstance(it, dict) and it.get(id_key) not in seen]
             for it in fresh:
                 seen.add(it.get(id_key))
-            if stop_at is not None:
-                # Evaluate every row (a stateful predicate may need to see the
-                # whole page); only then honour the first stop, and never if
-                # the predicate disabled itself meanwhile.
-                flags = [stop_at(it) for it in fresh]
-                cut = next((i for i, flag in enumerate(flags) if flag), None)
-                if cut is not None and not getattr(stop_at, "disabled", False):
-                    collected.extend(fresh[:cut])
-                    break
             collected.extend(fresh)
-            page_info = data.get("page") or {}
-            has_more = bool(page_info.get("nextPage")) and bool(fresh)
-            if not has_more:
+            page_info = data.get("page") if isinstance(data.get("page"), dict) else {}
+            if not page_info.get("nextPage"):
                 break
-            cursor = fresh[-1].get(id_key)
-            if not cursor:
-                break
+            next_cursor = fresh[-1].get(id_key) if fresh else None
+            if not fresh or not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+                raise IncompletePaginationError(
+                    f"{label}: incomplete pagination (the API advertised another page but this page contributed "
+                    "no fresh rows or no usable cursor); the result would be partial",
+                    path=path,
+                )
+            cursor = next_cursor
         else:
             # Every allowed page was consumed and the server still reports
             # more. If the caller asked for at most ``max_items`` and has
@@ -712,7 +806,7 @@ class MercuryClient:
             # this), so fail loudly instead.
             if max_items is None or len(collected) < max_items:
                 raise MercuryAPIError(
-                    f"GET {path} has more than {MAX_PAGES} pages ({len(collected)} items collected); "
+                    f"{label} has more than {MAX_PAGES} pages ({len(collected)} items collected); "
                     "narrow the query or raise MAX_PAGES",
                     path=path,
                 )
