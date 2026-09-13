@@ -114,7 +114,7 @@ needs_review    {linked_account_transfers: [...], unlabeled_debits: [...]}; each
                 display_name, counterparty_id | null, count, total, by_kind {kind: {count, total}},
                 would_flag, sample_transaction_ids (max 3), hint (fixed string),
                 possible_same_payee [other counterparty ids with the same normalised name],
-                name_merged_total, would_flag_merged (merged total >= threshold)
+                name_merged_total, would_flag_merged (true only when same-name siblings exist and their merged total reaches the threshold; single rows rely on would_flag — check either)
 unclassified[]  id, kind, status, amount, postedAt, counterpartyName, reason
 excluded_summary {category: {count, amount}}
 ```
