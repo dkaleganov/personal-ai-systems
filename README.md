@@ -9,6 +9,8 @@ AI builder, photographer, and animator on the weekends.
 
 ## What's in here
 
+MCP servers live in their own repositories and are linked from here.
+
 - **personal-health-systems-coach/** — A complete system prompt
   template plus Claude Skill for building your own AI health coach
   with Claude Projects, ChatGPT GPTs, or any LLM with persistent
@@ -21,17 +23,14 @@ AI builder, photographer, and animator on the weekends.
   by default, no delete ever, per-account encrypted tokens, and a
   CLAUDE.md so Claude Code can walk you through your own setup.
 
-- **mercury-multiorg-mcp/** — A read-only MCP server over several Mercury
-  banking organizations at once (the official connector binds one org
-  per connection): balances, transactions, statements (PDFs opt-in),
-  treasury, cards, invoices, a 1099 pre-filing cross-check, and a
-  keepalive CLI. Never a write endpoint; structured output masks account
-  numbers and tax ids to their last four (the opt-in PDF tools return
-  statements and invoices unredacted, by design).
+- **[mercury-multiorg-mcp](https://github.com/dkaleganov/mercury-multiorg-mcp)** —
+  An unofficial, read-only MCP server that works across several Mercury
+  banking organizations in one AI session; available on PyPI and in the
+  official MCP Registry.
 
 - **qbo-multicompany-mcp/** — Currently a build brief only (a CLAUDE.md
   design for a read-only multi-company QuickBooks Online MCP server);
-  no code yet.
+  no code yet. It will move to its own repository when built.
 
 ## Why this exists
 

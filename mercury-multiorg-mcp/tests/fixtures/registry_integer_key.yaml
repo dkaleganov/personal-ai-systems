@@ -1,6 +1,0 @@
-# Synthetic malformed registry (m4): a non-string top-level key. Must exit 2 with one line, never a traceback.
-entities:
-  - key: synthetic
-    display_name: Synthetic Example
-    token_env: MERCURY_TOKEN_SYNTHETIC_UNSET
-123: synthetic-extra-key
