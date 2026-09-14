@@ -132,9 +132,10 @@ def test_readme_client_section():
     assert "### Gemini CLI (`~/.gemini/settings.json` or `.gemini/settings.json`)" in README
     vscode = re.search(r"### VS Code \(`\.vscode/mcp\.json`\).*?```json(.*?)```", README)
     assert vscode and '"servers": {' in vscode.group(1) and '"type": "stdio"' in vscode.group(1) and "mcpServers" not in vscode.group(1)
-    # the same command and arguments in every snippet
-    args = re.findall(r'"--from", "git\+https://github\.com/dkaleganov/personal-ai-systems@<FULL_COMMIT_SHA>#subdirectory=mercury-multiorg-mcp", "mercury-multiorg-mcp", "--entities", "/private/path/entities\.yaml"', README)
-    assert len(args) >= 5
+    # the same command and arguments in every snippet (v0.1.3: the pinned PyPI release in all six client snippets)
+    args = re.findall(r'"mercury-multiorg-mcp@0\.1\.3", "--entities", "/private/path/entities\.yaml"', README)
+    assert len(args) == 6
+    assert '"--from", "git+https://' not in README  # the git+SHA form lives only under "From source / pinned commit"
 
 
 def test_readme_tool_inventory_wording():
@@ -180,7 +181,7 @@ def test_agents_and_changelog_rows():
     assert "](CLAUDE.md)" not in AGENTS and "one client's convention" not in AGENTS
     assert "two new majors and six minors" in CHANGELOG and "two new majors, four minors" not in CHANGELOG
     assert "## 0.1.2 (2026-09-13)" in CHANGELOG and "no runtime changes" in CHANGELOG
-    assert __version__ == "0.1.2" and "Version 0.1.2" in README
+    assert __version__ == "0.1.3" and "Version 0.1.3" in README  # bumped by the v0.1.3 packaging release
 
 
 def test_server_docstring_points_to_public_docs(mcp_client_sync=None):

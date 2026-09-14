@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mercury-multiorg-mcp"
-version = "0.1.2"
-description = "Read-only MCP server exposing multiple Mercury organizations to one AI session, routed by explicit entity key."
+version = "0.1.3"
+description = "Unofficial read-only MCP server exposing multiple Mercury banking organizations to one AI session, routed by explicit entity key."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -38,6 +38,9 @@ mercury-multiorg-mcp-keepalive = "mercury_multiorg_mcp.keepalive:main"
 [project.urls]
 Homepage = "https://github.com/dkaleganov/personal-ai-systems/tree/main/mercury-multiorg-mcp"
 Source = "https://github.com/dkaleganov/personal-ai-systems"
+Documentation = "https://github.com/dkaleganov/personal-ai-systems/blob/mercury-v0.1.3/mercury-multiorg-mcp/docs/tools.md"
+Changelog = "https://github.com/dkaleganov/personal-ai-systems/blob/mercury-v0.1.3/mercury-multiorg-mcp/CHANGELOG.md"
+Issues = "https://github.com/dkaleganov/personal-ai-systems/issues"
 
 [dependency-groups]
 dev = [

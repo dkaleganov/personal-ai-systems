@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.1.3 (2026-09-13)
+
+v0.1.3 — packaging for PyPI and the official MCP Registry (no runtime
+changes). Server and keepalive code are identical to 0.1.2.
+
+- Version 0.1.3.
+- `pyproject.toml`: the description now starts with "Unofficial";
+  `[project.urls]` adds Documentation (`docs/tools.md`) and Changelog
+  (`CHANGELOG.md`), both at tag `mercury-v0.1.3`, and Issues. License,
+  classifiers, and authors are unchanged.
+- README: the MCP Registry ownership marker (an `mcp-name` HTML comment,
+  read by the registry from the PyPI long description) and the disclaimer
+  "Unofficial. Not affiliated with or endorsed by Mercury." near the top.
+- README links: PyPI renders the README out of context, so every relative
+  link (`CHANGELOG.md`, `docs/tools.md`, `docs/keepalive.md`) is now an
+  absolute GitHub URL at tag `mercury-v0.1.3`; the `CLAUDE.md` link moves
+  from `main` to the tag; `entities.example.yaml`, `.env.example`, and
+  `LICENSE` are linked the same way.
+- Install: PyPI is the primary install, `uvx mercury-multiorg-mcp@0.1.3`.
+  Every client snippet (Claude Code, Claude Desktop, Codex CLI, Cursor /
+  Windsurf legacy Cascade, VS Code with `servers` and `"type": "stdio"`,
+  Gemini CLI) uses it. The clone and git+SHA forms move to a "From source /
+  pinned commit" subsection. The keepalive example uses
+  `uvx --from 'mercury-multiorg-mcp==0.1.3' mercury-multiorg-mcp-keepalive`.
+- `server.json` for the official MCP Registry (schema `2025-12-11`): PyPI
+  package, `uvx` runtime hint, stdio transport, repository subfolder,
+  `--entities` (required) and `--env-file` arguments, the optional
+  `MERCURY_ENTITIES_FILE`, `MERCURY_API_BASE`, and
+  `MERCURY_ALLOW_DOCUMENTS` variables, and one secret, not-required token
+  example whose description gives the naming rule (token variable names are
+  defined by your registry). Tracked in git; not shipped in the sdist or
+  wheel.
+- Tests: `tests/test_packaging_v013.py` pins the marker (exactly once), the
+  absence of relative links in README.md, tag-pinned repository links, the
+  pinned PyPI form in every client snippet (each parsed as JSON or TOML),
+  and `server.json` name, version, and package identifier/version against
+  `pyproject.toml`. The version and snippet pins in earlier review tests
+  follow the new text.
+
 ## 0.1.2 (2026-09-13)
 
 Documentation accuracy and schema metadata, from the third external review
